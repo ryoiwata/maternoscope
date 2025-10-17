@@ -375,7 +375,6 @@ for subreddit in "${SUBREDDIT_ARRAY[@]}"; do
         fi
         
         # Scrape the data
-        local scrape_result
         scrape_single "$subreddit" "$date" "$MAX_POSTS" "$OUTPUT_DIR" "$SNOWFLAKE_TABLE" "$SAVE_TO_SNOWFLAKE" "$VERBOSE"
         scrape_result=$?
         
