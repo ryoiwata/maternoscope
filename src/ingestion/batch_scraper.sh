@@ -3,7 +3,7 @@
 # Batch PullPush Reddit Scraper Script
 # Usage: ./batch_scraper.sh [options]
 
-set -e  # Exit on any error
+# Note: We don't use 'set -e' because we handle return codes explicitly in the scraping logic
 
 # Default values
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +17,7 @@ SAVE_TO_SNOWFLAKE=false
 SNOWFLAKE_TABLE="reddit_posts"
 VERBOSE=false
 DRY_RUN=false
+TEST_PATTERN=false
 NO_POSTS_THRESHOLD=3
 RATE_LIMIT_WAIT=3600
 
@@ -64,6 +65,7 @@ OPTIONS:
     --rate-limit-wait SECONDS      Wait time for rate limit reset in seconds (default: 3600)
     -v, --verbose                  Enable verbose logging
     --dry-run                      Show what would be done without executing
+    --test-pattern                 Test pattern matching for no-posts detection
     -h, --help                     Show this help message
 
 EXAMPLES:
@@ -213,12 +215,30 @@ scrape_single() {
     # Execute command and capture output
     local output
     if output=$(eval $cmd 2>&1); then
-        # Check if posts were actually found by looking for "Posts collected: 0" in output
-        if echo "$output" | grep -q "Posts collected: 0"; then
+        # Debug: Show the actual output for troubleshooting
+        if [[ "$verbose" == true ]]; then
+            echo "DEBUG - Scraper output:"
+            echo "$output"
+        fi
+        
+        # Check if posts were actually found by looking for "Successfully collected 0 posts" in output
+        if echo "$output" | grep -q "Successfully collected 0 posts"; then
             print_warning "No posts found for r/$subreddit on $date"
+            if [[ "$verbose" == true ]]; then
+                print_info "DEBUG: Pattern 'Successfully collected 0 posts' matched in output"
+            fi
             return 2  # Special return code for no posts found
         else
-            print_success "Successfully scraped r/$subreddit for $date"
+            # Also check for any posts count in the output
+            local posts_count=$(echo "$output" | grep -o "Successfully collected [0-9]* posts" | grep -o "[0-9]*")
+            if [[ -n "$posts_count" && "$posts_count" -gt 0 ]]; then
+                print_success "Successfully scraped $posts_count posts from r/$subreddit for $date"
+            else
+                print_success "Successfully scraped r/$subreddit for $date"
+            fi
+            if [[ "$verbose" == true ]]; then
+                print_info "DEBUG: Pattern 'Successfully collected 0 posts' NOT matched in output"
+            fi
             return 0
         fi
     else
@@ -274,6 +294,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --test-pattern)
+            TEST_PATTERN=true
+            shift
+            ;;
         -h|--help)
             show_usage
             exit 0
@@ -285,6 +309,36 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Test pattern matching if requested (do this before validation)
+if [[ "$TEST_PATTERN" == true ]]; then
+    print_info "Testing pattern matching for no-posts detection..."
+    print_info "Running: python $REDDIT_SCRIPT pregnant 2025-09-15 --max-posts 5"
+    
+    output=$(python "$REDDIT_SCRIPT" pregnant 2025-09-15 --max-posts 5 2>&1)
+    echo ""
+    print_info "Full scraper output:"
+    echo "$output"
+    echo ""
+    
+    if echo "$output" | grep -q "Successfully collected 0 posts"; then
+        print_success "✓ Pattern 'Successfully collected 0 posts' MATCHED"
+        print_info "This should trigger return code 2 (no posts found)"
+    else
+        print_error "✗ Pattern 'Successfully collected 0 posts' NOT MATCHED"
+        print_info "Looking for alternative patterns..."
+        
+        if echo "$output" | grep -q "collected.*0.*posts"; then
+            print_info "Found alternative pattern: 'collected.*0.*posts'"
+        fi
+        
+        if echo "$output" | grep -q "0 posts"; then
+            print_info "Found pattern: '0 posts'"
+        fi
+    fi
+    
+    exit 0
+fi
 
 # Validate required arguments
 if [[ -z "$SUBREDDITS" ]]; then
@@ -377,24 +431,32 @@ for subreddit in "${SUBREDDIT_ARRAY[@]}"; do
         # Scrape the data
         scrape_single "$subreddit" "$date" "$MAX_POSTS" "$OUTPUT_DIR" "$SNOWFLAKE_TABLE" "$SAVE_TO_SNOWFLAKE" "$VERBOSE"
         scrape_result=$?
+        if [[ "$verbose" == true ]]; then
+            print_info "Scraper returned code: $scrape_result"
+        fi
         
         case $scrape_result in
             0)  # Success with posts found
                 successful_scrapes=$((successful_scrapes + 1))
                 consecutive_no_posts=0  # Reset counter
+                print_info "Reset consecutive no-posts counter (found posts)"
                 ;;
             1)  # Failure
                 failed_scrapes=$((failed_scrapes + 1))
                 consecutive_no_posts=0  # Reset counter
+                print_info "Reset consecutive no-posts counter (scrape failed)"
                 ;;
             2)  # No posts found
                 consecutive_no_posts=$((consecutive_no_posts + 1))
-                print_warning "Consecutive no-posts count: $consecutive_no_posts"
+                print_warning "Consecutive no-posts count: $consecutive_no_posts (threshold: $NO_POSTS_THRESHOLD)"
                 
                 # If we've hit the threshold for consecutive no-posts, wait for rate limit
                 if [[ $consecutive_no_posts -ge $NO_POSTS_THRESHOLD ]]; then
+                    print_warning "Rate limit threshold reached ($NO_POSTS_THRESHOLD consecutive no-posts). Triggering wait..."
                     wait_for_rate_limit
                     consecutive_no_posts=0  # Reset counter after waiting
+                else
+                    print_info "Not yet at threshold. Continuing..."
                 fi
                 ;;
         esac
