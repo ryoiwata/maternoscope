@@ -17,6 +17,8 @@ SAVE_TO_SNOWFLAKE=false
 SNOWFLAKE_TABLE="reddit_posts"
 VERBOSE=false
 DRY_RUN=false
+NO_POSTS_THRESHOLD=3
+RATE_LIMIT_WAIT=3600
 
 # Colors for output
 RED='\033[0;31m'
@@ -58,6 +60,8 @@ OPTIONS:
     -o, --output-dir DIR           Output directory (default: ./data)
     --snowflake                    Save to Snowflake (requires .env configuration)
     --snowflake-table TABLE        Snowflake table name (default: reddit_posts)
+    --no-posts-threshold N         Wait for rate limit after N consecutive no-posts (default: 3)
+    --rate-limit-wait SECONDS      Wait time for rate limit reset in seconds (default: 3600)
     -v, --verbose                  Enable verbose logging
     --dry-run                      Show what would be done without executing
     -h, --help                     Show this help message
@@ -71,6 +75,9 @@ EXAMPLES:
 
     # Dry run to see what would be scraped
     $0 -s "pregnancy,babybumps" -d 2024-01-01 -e 2024-01-07 --dry-run
+
+    # With custom rate limiting (wait after 5 consecutive no-posts, wait 30 minutes)
+    $0 -s "pregnancy" -d 2024-01-01 -e 2024-01-31 --no-posts-threshold 5 --rate-limit-wait 1800
 
 ADVANTAGES OF PULLPUSH API:
     - Better for historical data
@@ -109,6 +116,24 @@ generate_date_range() {
         echo "$current_date"
         current_date=$(date -d "$current_date + 1 day" +%Y-%m-%d)
     done
+}
+
+# Function to wait for rate limit reset
+wait_for_rate_limit() {
+    local wait_time=$RATE_LIMIT_WAIT
+    local hours=$((wait_time / 3600))
+    local minutes=$(((wait_time % 3600) / 60))
+    local seconds=$((wait_time % 60))
+    
+    print_warning "Rate limit detected. Waiting $wait_time seconds (${hours}h ${minutes}m ${seconds}s) before continuing..."
+    
+    # Show countdown
+    for ((i=wait_time; i>0; i--)); do
+        printf "\r${YELLOW}[WAIT]${NC} Rate limit cooldown: %02d:%02d:%02d remaining..." $((i/3600)) $(((i%3600)/60)) $((i%60))
+        sleep 1
+    done
+    echo ""
+    print_info "Rate limit cooldown complete. Resuming scraping..."
 }
 
 # Function to check if data already exists
@@ -185,10 +210,17 @@ scrape_single() {
         return 0
     fi
     
-    # Execute command
-    if eval $cmd; then
-        print_success "Successfully scraped r/$subreddit for $date"
-        return 0
+    # Execute command and capture output
+    local output
+    if output=$(eval $cmd 2>&1); then
+        # Check if posts were actually found by looking for "Posts collected: 0" in output
+        if echo "$output" | grep -q "Posts collected: 0"; then
+            print_warning "No posts found for r/$subreddit on $date"
+            return 2  # Special return code for no posts found
+        else
+            print_success "Successfully scraped r/$subreddit for $date"
+            return 0
+        fi
     else
         print_error "Failed to scrape r/$subreddit for $date"
         return 1
@@ -224,6 +256,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --snowflake-table)
             SNOWFLAKE_TABLE="$2"
+            shift 2
+            ;;
+        --no-posts-threshold)
+            NO_POSTS_THRESHOLD="$2"
+            shift 2
+            ;;
+        --rate-limit-wait)
+            RATE_LIMIT_WAIT="$2"
             shift 2
             ;;
         -v|--verbose)
@@ -314,6 +354,7 @@ current_combination=0
 successful_scrapes=0
 failed_scrapes=0
 skipped_scrapes=0
+consecutive_no_posts=0
 
 # Main scraping loop
 for subreddit in "${SUBREDDIT_ARRAY[@]}"; do
@@ -334,13 +375,32 @@ for subreddit in "${SUBREDDIT_ARRAY[@]}"; do
         fi
         
         # Scrape the data
-        if scrape_single "$subreddit" "$date" "$MAX_POSTS" "$OUTPUT_DIR" "$SNOWFLAKE_TABLE" "$SAVE_TO_SNOWFLAKE" "$VERBOSE"; then
-            successful_scrapes=$((successful_scrapes + 1))
-        else
-            failed_scrapes=$((failed_scrapes + 1))
-        fi
+        local scrape_result
+        scrape_single "$subreddit" "$date" "$MAX_POSTS" "$OUTPUT_DIR" "$SNOWFLAKE_TABLE" "$SAVE_TO_SNOWFLAKE" "$VERBOSE"
+        scrape_result=$?
         
-        # Add small delay between requests to be respectful to Reddit API
+        case $scrape_result in
+            0)  # Success with posts found
+                successful_scrapes=$((successful_scrapes + 1))
+                consecutive_no_posts=0  # Reset counter
+                ;;
+            1)  # Failure
+                failed_scrapes=$((failed_scrapes + 1))
+                consecutive_no_posts=0  # Reset counter
+                ;;
+            2)  # No posts found
+                consecutive_no_posts=$((consecutive_no_posts + 1))
+                print_warning "Consecutive no-posts count: $consecutive_no_posts"
+                
+                # If we've hit the threshold for consecutive no-posts, wait for rate limit
+                if [[ $consecutive_no_posts -ge $NO_POSTS_THRESHOLD ]]; then
+                    wait_for_rate_limit
+                    consecutive_no_posts=0  # Reset counter after waiting
+                fi
+                ;;
+        esac
+        
+        # Add small delay between requests to be respectful to PullPush API
         sleep 2
         
     done < <(generate_date_range "$START_DATE" "$END_DATE")
