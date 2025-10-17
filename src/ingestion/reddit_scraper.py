@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import time
 import logging
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
 
 # Load environment variables
 load_dotenv()
@@ -89,7 +91,9 @@ class RedditScraper:
                             post_count += 1
 
                             if post_count % 100 == 0:
-                                logger.info(f"Collected {post_count} posts so far...")
+                                logger.info(
+                                    f"Collected {post_count} posts so far..."
+                                )
 
                         # If we've gone past our target date, break
                         elif post_date < start_of_day:
@@ -223,6 +227,111 @@ class RedditScraper:
             logger.error(f"Error saving to JSON: {e}")
 
 
+class SnowflakeConnector:
+    def __init__(self):
+        """Initialize Snowflake connection using environment variables."""
+        self.connection = None
+        self.connect()
+
+    def connect(self):
+        """Establish connection to Snowflake."""
+        try:
+            self.connection = snowflake.connector.connect(
+                user=os.getenv("SNOWFLAKE_USERNAME"),
+                password=os.getenv("SNOWFLAKE_PASSWORD"),
+                account=os.getenv("SNOWFLAKE_ACCOUNT"),
+                warehouse=os.getenv("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+                database=os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE"),
+                schema=os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
+                role=os.getenv("SNOWFLAKE_ROLE", "ACCOUNTADMIN")
+            )
+            logger.info("Successfully connected to Snowflake")
+        except Exception as e:
+            logger.error(f"Error connecting to Snowflake: {e}")
+            raise
+
+    def create_table_if_not_exists(self, table_name="reddit_posts"):
+        """Create the reddit_posts table if it doesn't exist."""
+        try:
+            cursor = self.connection.cursor()
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                POST_ID VARCHAR(255) PRIMARY KEY,
+                POST_DATE TIMESTAMP_NTZ,
+                POST_TIMESTAMP NUMBER,
+                POST_FLAIR VARCHAR(500),
+                TITLE VARCHAR(2000),
+                URL VARCHAR(2000),
+                CONTENT VARCHAR(16777216),
+                SCORE NUMBER,
+                NUM_COMMENTS NUMBER,
+                SUBREDDIT VARCHAR(255),
+                SCRAPED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            )
+            """
+
+            cursor.execute(create_table_sql)
+            cursor.close()
+            logger.info(f"Table {table_name} created or already exists")
+        except Exception as e:
+            logger.error(f"Error creating table: {e}")
+            raise
+
+    def save_to_snowflake(self, posts_data, table_name="reddit_posts"):
+        """
+        Save posts data to Snowflake table.
+
+        Args:
+            posts_data (list): List of post dictionaries
+            table_name (str): Target table name
+        """
+        try:
+            if not posts_data:
+                logger.warning("No data to save to Snowflake")
+                return
+            # Create table if it doesn't exist
+            self.create_table_if_not_exists(table_name)
+            # Convert to DataFrame
+            df = pd.DataFrame(posts_data)
+            # Convert post_date to datetime
+            df['post_date'] = pd.to_datetime(df['post_date'])
+            # Add scraped_at timestamp
+            df['scraped_at'] = datetime.now()
+            
+            # Ensure column names are uppercase for Snowflake compatibility
+            df.columns = [col.upper() for col in df.columns]
+            
+            # Log DataFrame info for debugging
+            logger.info(f"DataFrame shape: {df.shape}")
+            logger.info(f"DataFrame columns: {list(df.columns)}")
+
+            # Write to Snowflake
+            success, nchunks, nrows, _ = write_pandas(
+                self.connection,
+                df,
+                table_name,
+                auto_create_table=False,
+                overwrite=False
+            )
+
+            if success:
+                logger.info(
+                    f"Successfully saved {nrows} rows to Snowflake table "
+                    f"{table_name}"
+                )
+            else:
+                logger.error("Failed to save data to Snowflake")
+        except Exception as e:
+            logger.error(f"Error saving to Snowflake: {e}")
+            raise
+
+    def close(self):
+        """Close Snowflake connection."""
+        if self.connection:
+            self.connection.close()
+            logger.info("Snowflake connection closed")
+
+
 def main():
     """Main function to run the Reddit scraper."""
     parser = argparse.ArgumentParser(
@@ -234,6 +343,10 @@ def main():
                         help='Maximum number of posts to retrieve')
     parser.add_argument('--output-csv', help='Output CSV filename')
     parser.add_argument('--output-json', help='Output JSON filename')
+    parser.add_argument('--save-to-snowflake', action='store_true',
+                        help='Save data to Snowflake table')
+    parser.add_argument('--snowflake-table', default='reddit_posts',
+                        help='Snowflake table name (default: reddit_posts)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose logging')
 
@@ -275,6 +388,18 @@ def main():
     if args.output_json:
         scraper.save_to_json(posts, args.output_json)
 
+    # Save to Snowflake if requested
+    snowflake_connector = None
+    if args.save_to_snowflake:
+        try:
+            snowflake_connector = SnowflakeConnector()
+            snowflake_connector.save_to_snowflake(posts, args.snowflake_table)
+        except Exception as e:
+            logger.error(f"Failed to save to Snowflake: {e}")
+        finally:
+            if snowflake_connector:
+                snowflake_connector.close()
+
     # Print summary
     print("\nSummary:")
     print(f"Subreddit: r/{args.subreddit}")
@@ -284,6 +409,8 @@ def main():
         print(f"CSV file: {args.output_csv}")
     if args.output_json:
         print(f"JSON file: {args.output_json}")
+    if args.save_to_snowflake:
+        print(f"Snowflake table: {args.snowflake_table}")
 
 
 if __name__ == "__main__":

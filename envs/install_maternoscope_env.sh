@@ -6,3 +6,7 @@ pip install python-dotenv
 conda install conda-forge::schedule --yes
 conda install conda-forge::praw --yes
 conda install conda-forge::pandas --yes
+conda install -c conda-forge pyarrow --yes
+
+conda install conda-forge::snowflake-connector-python --yes
+pip install --upgrade "snowflake-connector-python[pandas]"
