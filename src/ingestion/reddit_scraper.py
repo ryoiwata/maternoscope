@@ -232,6 +232,39 @@ class RedditScraper:
         except Exception as e:
             logger.error(f"Error saving to JSON: {e}")
 
+    def check_existing_csv(self, subreddit, target_date, output_dir="."):
+        """
+        Check if CSV files already exist for a given subreddit and date.
+        
+        Args:
+            subreddit (str): Subreddit name
+            target_date (str): Target date in YYYY-MM-DD format
+            output_dir (str): Output directory to search
+            
+        Returns:
+            bool: True if CSV files exist, False otherwise
+        """
+        try:
+            import glob
+            import os
+            
+            # Search for CSV files matching the pattern
+            pattern = os.path.join(output_dir, f"reddit_posts_{subreddit}_{target_date}_*.csv")
+            existing_files = glob.glob(pattern)
+            
+            if existing_files:
+                logger.info(f"Found {len(existing_files)} existing CSV file(s) for r/{subreddit} on {target_date}")
+                for file in existing_files:
+                    logger.info(f"  - {file}")
+                return True
+            else:
+                logger.info(f"No existing CSV files found for r/{subreddit} on {target_date}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking existing CSV files: {e}")
+            return False
+
 
 class SnowflakeConnector:
     def __init__(self):
@@ -336,6 +369,55 @@ class SnowflakeConnector:
             logger.error(f"Error saving to Snowflake: {e}")
             raise
 
+    def check_existing_data(self, subreddit, target_date, table_name="reddit_posts"):
+        """
+        Check if data already exists for a given subreddit and date.
+        
+        Args:
+            subreddit (str): Subreddit name
+            target_date (str): Target date in YYYY-MM-DD format
+            table_name (str): Snowflake table name
+            
+        Returns:
+            bool: True if data exists, False otherwise
+        """
+        try:
+            cursor = self.connection.cursor()
+            
+            # Check if table exists first
+            cursor.execute(f"""
+                SELECT COUNT(*) 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_NAME = UPPER('{table_name}')
+            """)
+            table_exists = cursor.fetchone()[0] > 0
+            
+            if not table_exists:
+                cursor.close()
+                return False
+            
+            # Check for existing data
+            cursor.execute(f"""
+                SELECT COUNT(*) 
+                FROM {table_name} 
+                WHERE UPPER(SUBREDDIT) = UPPER('{subreddit}') 
+                AND DATE(POST_DATE) = '{target_date}'
+            """)
+            
+            count = cursor.fetchone()[0]
+            cursor.close()
+            
+            if count > 0:
+                logger.info(f"Found {count} existing records for r/{subreddit} on {target_date}")
+                return True
+            else:
+                logger.info(f"No existing records found for r/{subreddit} on {target_date}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error checking existing data: {e}")
+            return False
+    
     def close(self):
         """Close Snowflake connection."""
         if self.connection:
@@ -358,6 +440,10 @@ def main():
                         help='Save data to Snowflake table')
     parser.add_argument('--snowflake-table', default='reddit_posts',
                         help='Snowflake table name (default: reddit_posts)')
+    parser.add_argument('--check-duplicates', action='store_true',
+                        help='Check for existing data before scraping')
+    parser.add_argument('--output-dir', default='.',
+                        help='Output directory for CSV/JSON files (default: current directory)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose logging')
 
@@ -376,6 +462,40 @@ def main():
     # Initialize scraper
     scraper = RedditScraper()
 
+    # Check for existing data if requested
+    if args.check_duplicates:
+        logger.info("Checking for existing data...")
+        
+        # Check CSV files
+        csv_exists = scraper.check_existing_csv(args.subreddit, args.date, args.output_dir)
+        
+        # Check Snowflake if enabled
+        snowflake_exists = False
+        if args.save_to_snowflake:
+            try:
+                snowflake_connector = SnowflakeConnector()
+                snowflake_exists = snowflake_connector.check_existing_data(
+                    args.subreddit, args.date, args.snowflake_table
+                )
+                snowflake_connector.close()
+            except Exception as e:
+                logger.warning(f"Could not check Snowflake for existing data: {e}")
+        
+        # If data exists in either location, ask user what to do
+        if csv_exists or snowflake_exists:
+            logger.warning("Existing data found!")
+            if csv_exists:
+                logger.warning("  - CSV files exist")
+            if snowflake_exists:
+                logger.warning("  - Snowflake data exists")
+            
+            response = input("Do you want to continue scraping anyway? (y/N): ").strip().lower()
+            if response not in ['y', 'yes']:
+                logger.info("Scraping cancelled by user.")
+                return
+            else:
+                logger.info("Continuing with scraping...")
+
     # Get posts
     posts = scraper.get_posts_for_date(args.subreddit, args.date,
                                        args.max_posts)
@@ -387,10 +507,12 @@ def main():
     # Generate default filenames if not provided
     if not args.output_csv and not args.output_json:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_csv = (f"reddit_posts_{args.subreddit}_{args.date}_"
-                           f"{timestamp}.csv")
-        args.output_json = (f"reddit_posts_{args.subreddit}_{args.date}_"
-                            f"{timestamp}.json")
+        args.output_csv = os.path.join(args.output_dir, 
+                                       f"reddit_posts_{args.subreddit}_{args.date}_"
+                                       f"{timestamp}.csv")
+        args.output_json = os.path.join(args.output_dir,
+                                        f"reddit_posts_{args.subreddit}_{args.date}_"
+                                        f"{timestamp}.json")
 
     # Save data
     if args.output_csv:
