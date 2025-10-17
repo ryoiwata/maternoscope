@@ -174,9 +174,7 @@ class RedditScraper:
 
             post_data = {
                 'post_id': submission.id,
-                'post_date': datetime.fromtimestamp(
-                    submission.created_utc
-                ).strftime('%Y-%m-%d %H:%M:%S'),
+                'post_date': datetime.fromtimestamp(submission.created_utc),
                 'post_timestamp': submission.created_utc,
                 'post_flair': flair,
                 'title': submission.title,
@@ -220,8 +218,16 @@ class RedditScraper:
         """
         try:
             import json
+            from datetime import datetime
+            
+            # Convert datetime objects to strings for JSON serialization
+            def datetime_converter(obj):
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+            
             with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(posts_data, f, indent=2, ensure_ascii=False)
+                json.dump(posts_data, f, indent=2, ensure_ascii=False, default=datetime_converter)
             logger.info(f"Data saved to {filename}")
         except Exception as e:
             logger.error(f"Error saving to JSON: {e}")
@@ -257,7 +263,7 @@ class SnowflakeConnector:
             create_table_sql = f"""
             CREATE TABLE IF NOT EXISTS {table_name} (
                 POST_ID VARCHAR(255) PRIMARY KEY,
-                POST_DATE TIMESTAMP_NTZ,
+                POST_DATE TIMESTAMP_TZ,
                 POST_TIMESTAMP NUMBER,
                 POST_FLAIR VARCHAR(500),
                 TITLE VARCHAR(2000),
@@ -266,7 +272,7 @@ class SnowflakeConnector:
                 SCORE NUMBER,
                 NUM_COMMENTS NUMBER,
                 SUBREDDIT VARCHAR(255),
-                SCRAPED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                SCRAPED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
             )
             """
 
@@ -293,10 +299,12 @@ class SnowflakeConnector:
             self.create_table_if_not_exists(table_name)
             # Convert to DataFrame
             df = pd.DataFrame(posts_data)
-            # Convert post_date to datetime
-            df['post_date'] = pd.to_datetime(df['post_date'])
-            # Add scraped_at timestamp
-            df['scraped_at'] = datetime.now()
+            
+            # Ensure post_date is datetime and in UTC timezone
+            df['post_date'] = pd.to_datetime(df['post_date'], utc=True)
+            
+            # Add scraped_at timestamp in UTC
+            df['scraped_at'] = pd.Timestamp.now(tz='UTC')
             
             # Ensure column names are uppercase for Snowflake compatibility
             df.columns = [col.upper() for col in df.columns]
@@ -304,6 +312,8 @@ class SnowflakeConnector:
             # Log DataFrame info for debugging
             logger.info(f"DataFrame shape: {df.shape}")
             logger.info(f"DataFrame columns: {list(df.columns)}")
+            logger.info(f"Sample POST_DATE values: {df['POST_DATE'].head().tolist()}")
+            logger.info(f"POST_DATE dtype: {df['POST_DATE'].dtype}")
 
             # Write to Snowflake
             success, nchunks, nrows, _ = write_pandas(
@@ -311,7 +321,8 @@ class SnowflakeConnector:
                 df,
                 table_name,
                 auto_create_table=False,
-                overwrite=False
+                overwrite=False,
+                use_logical_type=True
             )
 
             if success:
