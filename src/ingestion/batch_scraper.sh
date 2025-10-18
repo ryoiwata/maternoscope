@@ -61,8 +61,9 @@ OPTIONS:
     -o, --output-dir DIR           Output directory (default: ./data)
     --snowflake                    Save to Snowflake (requires .env configuration)
     --snowflake-table TABLE        Snowflake table name (default: reddit_posts)
-    --no-posts-threshold N         Wait for rate limit after N consecutive no-posts (default: 3)
+    --no-posts-threshold N         Wait for rate limit after N attempts on current combination (default: 3)
     --rate-limit-wait SECONDS      Wait time for rate limit reset in seconds (default: 3600)
+    --max-retries N                Maximum retry attempts per attempt cycle (default: 5)
     -v, --verbose                  Enable verbose logging
     --dry-run                      Show what would be done without executing
     --test-pattern                 Test pattern matching for no-posts detection
@@ -78,7 +79,7 @@ EXAMPLES:
     # Dry run to see what would be scraped
     $0 -s "pregnancy,babybumps" -d 2024-01-01 -e 2024-01-07 --dry-run
 
-    # With custom rate limiting (wait after 5 consecutive no-posts, wait 30 minutes)
+    # With custom rate limiting (wait after 5 attempts on current combination, wait 30 minutes)
     $0 -s "pregnancy" -d 2024-01-01 -e 2024-01-31 --no-posts-threshold 5 --rate-limit-wait 1800
 
 ADVANTAGES OF PULLPUSH API:
@@ -136,6 +137,71 @@ wait_for_rate_limit() {
     done
     echo ""
     print_info "Rate limit cooldown complete. Resuming scraping..."
+}
+
+# Function to log failed scrapes
+log_failed_scrape() {
+    local subreddit=$1
+    local date=$2
+    local reason=$3
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "$timestamp - r/$subreddit - $date - $reason" >> "$FAILED_SCRAPES_LOG"
+    print_warning "Logged failed scrape: r/$subreddit on $date - $reason"
+}
+
+# Function to retry scraping with simple retry logic
+retry_scrape() {
+    local subreddit=$1
+    local date=$2
+    local max_posts=$3
+    local output_dir=$4
+    local snowflake_table=$5
+    local save_to_snowflake=$6
+    local verbose=$7
+    
+    local attempt=1
+    local max_attempts=$max_retry_attempts
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        print_info "Retry attempt $attempt/$max_attempts for r/$subreddit on $date"
+        
+        # Scrape the data
+        scrape_single "$subreddit" "$date" "$max_posts" "$output_dir" "$snowflake_table" "$save_to_snowflake" "$verbose"
+        local scrape_result=$?
+        
+        if [[ "$verbose" == true ]]; then
+            print_info "Scraper returned code: $scrape_result"
+        fi
+        
+        case $scrape_result in
+            0)  # Success with posts found
+                print_success "Successfully scraped r/$subreddit on $date on attempt $attempt"
+                return 0
+                ;;
+            1)  # Failure - retry immediately
+                print_warning "Scrape failed for r/$subreddit on $date (attempt $attempt/$max_attempts)"
+                if [[ $attempt -lt $max_attempts ]]; then
+                    print_info "Retrying immediately..."
+                fi
+                ;;
+            2)  # No posts found - retry immediately
+                print_warning "No posts found for r/$subreddit on $date (attempt $attempt/$max_attempts)"
+                if [[ $attempt -lt $max_attempts ]]; then
+                    print_info "Retrying immediately..."
+                else
+                    print_warning "Max retry attempts reached for r/$subreddit on $date. Moving on."
+                    log_failed_scrape "$subreddit" "$date" "No posts found after $max_attempts attempts"
+                    return 2
+                fi
+                ;;
+        esac
+        
+        attempt=$((attempt + 1))
+    done
+    
+    # If we get here, all attempts failed
+    log_failed_scrape "$subreddit" "$date" "Failed after $max_attempts attempts"
+    return 1
 }
 
 # Function to check if data already exists
@@ -286,6 +352,10 @@ while [[ $# -gt 0 ]]; do
             RATE_LIMIT_WAIT="$2"
             shift 2
             ;;
+        --max-retries)
+            max_retry_attempts="$2"
+            shift 2
+            ;;
         -v|--verbose)
             VERBOSE=true
             shift
@@ -408,7 +478,9 @@ current_combination=0
 successful_scrapes=0
 failed_scrapes=0
 skipped_scrapes=0
-consecutive_no_posts=0
+
+# Create failed scrapes log file
+FAILED_SCRAPES_LOG="$OUTPUT_DIR/failed_scrapes_$(date +%Y%m%d_%H%M%S).log"
 
 # Main scraping loop
 for subreddit in "${SUBREDDIT_ARRAY[@]}"; do
@@ -428,38 +500,51 @@ for subreddit in "${SUBREDDIT_ARRAY[@]}"; do
             continue
         fi
         
-        # Scrape the data
-        scrape_single "$subreddit" "$date" "$MAX_POSTS" "$OUTPUT_DIR" "$SNOWFLAKE_TABLE" "$SAVE_TO_SNOWFLAKE" "$VERBOSE"
-        scrape_result=$?
-        if [[ "$verbose" == true ]]; then
-            print_info "Scraper returned code: $scrape_result"
-        fi
+        # Try to scrape with retries until rate limit threshold is reached
+        scrape_success=false
+        current_attempts=0
         
-        case $scrape_result in
-            0)  # Success with posts found
-                successful_scrapes=$((successful_scrapes + 1))
-                consecutive_no_posts=0  # Reset counter
-                print_info "Reset consecutive no-posts counter (found posts)"
-                ;;
-            1)  # Failure
-                failed_scrapes=$((failed_scrapes + 1))
-                consecutive_no_posts=0  # Reset counter
-                print_info "Reset consecutive no-posts counter (scrape failed)"
-                ;;
-            2)  # No posts found
-                consecutive_no_posts=$((consecutive_no_posts + 1))
-                print_warning "Consecutive no-posts count: $consecutive_no_posts (threshold: $NO_POSTS_THRESHOLD)"
-                
-                # If we've hit the threshold for consecutive no-posts, wait for rate limit
-                if [[ $consecutive_no_posts -ge $NO_POSTS_THRESHOLD ]]; then
-                    print_warning "Rate limit threshold reached ($NO_POSTS_THRESHOLD consecutive no-posts). Triggering wait..."
+        while [[ "$scrape_success" == false ]]; do
+            # Use retry mechanism
+            retry_scrape "$subreddit" "$date" "$MAX_POSTS" "$OUTPUT_DIR" "$SNOWFLAKE_TABLE" "$SAVE_TO_SNOWFLAKE" "$VERBOSE"
+            retry_result=$?
+            current_attempts=$((current_attempts + 1))
+            
+            case $retry_result in
+                0)  # Success
+                    successful_scrapes=$((successful_scrapes + 1))
+                    scrape_success=true
+                    print_success "Successfully completed r/$subreddit for $date"
+                    ;;
+                1)  # Complete failure after all retries
+                    failed_scrapes=$((failed_scrapes + 1))
+                    print_error "Failed to scrape r/$subreddit for $date after all retries"
+                    ;;
+                2)  # No posts found after all retries
+                    print_warning "No posts found for r/$subreddit on $date after all retries"
+                    ;;
+            esac
+            
+            # If we haven't succeeded, check if we should wait for rate limit
+            if [[ "$scrape_success" == false ]]; then
+                if [[ $current_attempts -ge $NO_POSTS_THRESHOLD ]]; then
+                    print_warning "Rate limit threshold reached ($NO_POSTS_THRESHOLD attempts). Triggering wait..."
                     wait_for_rate_limit
-                    consecutive_no_posts=0  # Reset counter after waiting
+                    print_info "Resuming scraping after rate limit wait..."
+                    # Reset attempt counter and continue the loop to retry the current date/subreddit
+                    current_attempts=0
                 else
-                    print_info "Not yet at threshold. Continuing..."
+                    print_warning "Attempts: $current_attempts (threshold: $NO_POSTS_THRESHOLD)"
+                    print_info "Retrying current combination..."
                 fi
-                ;;
-        esac
+            fi
+        done
+        
+        # If we still haven't succeeded after all attempts, log it and move on
+        if [[ "$scrape_success" == false ]]; then
+            print_error "Giving up on r/$subreddit for $date after all attempts"
+            log_failed_scrape "$subreddit" "$date" "Gave up after rate limit threshold reached"
+        fi
         
         # Add small delay between requests to be respectful to PullPush API
         sleep 2
@@ -475,6 +560,13 @@ if [[ $skipped_scrapes -gt 0 ]]; then
 fi
 if [[ $failed_scrapes -gt 0 ]]; then
     print_error "Failed scrapes: $failed_scrapes"
+    print_warning "Failed scrapes have been logged to: $FAILED_SCRAPES_LOG"
+fi
+
+# Show failed scrapes log if it exists and has content
+if [[ -f "$FAILED_SCRAPES_LOG" && -s "$FAILED_SCRAPES_LOG" ]]; then
+    print_info "Failed scrapes log contents:"
+    cat "$FAILED_SCRAPES_LOG"
 fi
 
 # Exit with appropriate code
