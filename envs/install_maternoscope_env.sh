@@ -14,6 +14,6 @@ pip install --upgrade "snowflake-connector-python[pandas]"
 conda install conda-forge::openpyxl --yes
 conda install anaconda::psycopg2 --yes
 
-conda install conda-forge::dbt-core --yes
-conda install conda-forge::dbt-snowflake --yes
-
+pip install dbt-core 
+pip install dbt-postgres
+pip install dbt-snowflake
