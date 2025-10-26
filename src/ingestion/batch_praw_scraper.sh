@@ -2,14 +2,15 @@
 # Batch scraper for top pregnancy-related Reddit posts
 # Uses PRAW to scrape top posts from last day across multiple subreddits
 
-set -e  # Exit on error
+# Don't exit on error - we want to continue processing other subreddits
+# set -e  # Exit on error
 
 # Suppress AWS botocore debug messages
 export AWS_EC2_METADATA_DISABLED=true
 export BOTO_CONFIG=/dev/null
 
 # Configuration
-SUBREDDITS=("pregnant" "BabyBumps" "TryingForABaby" "beyondthebump")
+SUBREDDITS=("pregnant" "BabyBumps" "TryingForABaby" "beyondthebump" "newborns" "Miscarriage" "NewParents")
 TIME_FILTER="day"  # Top posts from past day
 OUTPUT_DIR="data/raw/reddit"
 SCRIPT_DIR="src/ingestion"
@@ -33,7 +34,7 @@ scrape_subreddit() {
     log "Time filter: $TIME_FILTER"
     log "=========================================="
     
-    # Run the PRAW scraper and capture errors
+    # Run the PRAW scraper and capture errors (append to error log)
     if python3 "$SCRIPT_DIR/praw_scraper.py" \
         "$subreddit" \
         "$TIME_FILTER" \
@@ -41,12 +42,14 @@ scrape_subreddit() {
         --save-to-snowflake \
         --snowflake-table "REDDIT_POSTS" \
         --check-duplicates \
-        --verbose 2>"$ERROR_LOG"; then
+        --verbose 2>>"$ERROR_LOG"; then
         log "Completed scrape for r/$subreddit successfully"
     else
         exit_code=$?
         log "ERROR: Failed to scrape r/$subreddit (exit code: $exit_code)"
+        echo -e "\n========================================" >> "$ERROR_LOG"
         echo "[$(date +'%Y-%m-%d %H:%M:%S')] Error scraping r/$subreddit (exit code: $exit_code)" >> "$ERROR_LOG"
+        echo "========================================\n" >> "$ERROR_LOG"
     fi
     log ""
     
