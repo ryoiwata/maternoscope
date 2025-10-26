@@ -4,6 +4,15 @@ envs/
 *.csv
 *.json
 old/
+logs/
+
+# Data directories
+data/raw/
+data/processed/
+
+# Log directories  
+logs/ingestion/
+logs/dbt/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

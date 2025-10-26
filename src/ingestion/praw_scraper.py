@@ -15,6 +15,11 @@ import json
 # Load environment variables
 load_dotenv()
 
+# Disable AWS botocore debug logging
+logging.getLogger('botocore').setLevel(logging.ERROR)
+logging.getLogger('boto3').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -183,7 +188,7 @@ class SnowflakeConnector:
         try:
             cursor = self.conn.cursor()
             
-            # First, create the table if it doesn't exist
+            # Create the table if it doesn't exist
             create_table_sql = f"""
             CREATE TABLE IF NOT EXISTS {table_name} (
                 POST_ID VARCHAR(255) PRIMARY KEY,
@@ -201,32 +206,9 @@ class SnowflakeConnector:
             """
             
             cursor.execute(create_table_sql)
-            
-            # Check if TIME_FILTER column exists, if not add it
-            try:
-                check_column_sql = f"""
-                SELECT COUNT(*) 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = '{table_name.upper()}' 
-                AND COLUMN_NAME = 'TIME_FILTER'
-                """
-                cursor.execute(check_column_sql)
-                column_exists = cursor.fetchone()[0] > 0
-                
-                if not column_exists:
-                    logger.info(f"Adding TIME_FILTER column to {table_name}")
-                    alter_table_sql = f"ALTER TABLE {table_name} ADD COLUMN TIME_FILTER VARCHAR(50)"
-                    cursor.execute(alter_table_sql)
-                    logger.info(f"Successfully added TIME_FILTER column to {table_name}")
-                else:
-                    logger.info(f"TIME_FILTER column already exists in {table_name}")
-                    
-            except Exception as e:
-                logger.warning(f"Could not check/add TIME_FILTER column: {e}")
-                # Continue anyway, the table creation was successful
+            logger.info(f"Table {table_name} created or already exists")
             
             cursor.close()
-            logger.info(f"Table {table_name} created or already exists")
         except Exception as e:
             logger.error(f"Error creating table: {e}")
             raise
@@ -247,9 +229,6 @@ class SnowflakeConnector:
             # Ensure post_date is timezone-aware UTC datetime
             df['post_date'] = pd.to_datetime(df['post_date'], utc=True)
             df['scraped_at'] = pd.to_datetime(df['scraped_at'], utc=True)
-            
-            # Add time_filter column
-            df['time_filter'] = time_filter
             
             # Convert column names to uppercase for Snowflake
             df.columns = [col.upper() for col in df.columns]
@@ -278,17 +257,17 @@ class SnowflakeConnector:
             raise
 
     def check_existing_data(self, subreddit, time_filter, table_name="top_reddit_posts"):
-        """Check if data already exists in Snowflake for this subreddit and time filter."""
+        """Check if data already exists in Snowflake for this subreddit."""
         try:
             cursor = self.conn.cursor()
             
             query = f"""
             SELECT COUNT(*) 
             FROM {table_name} 
-            WHERE SUBREDDIT = %s AND TIME_FILTER = %s
+            WHERE SUBREDDIT = %s
             """
             
-            cursor.execute(query, (subreddit, time_filter))
+            cursor.execute(query, (subreddit,))
             count = cursor.fetchone()[0]
             cursor.close()
             
