@@ -11,4 +11,9 @@ conda install -c conda-forge pyarrow --yes
 conda install conda-forge::snowflake-connector-python --yes
 pip install --upgrade "snowflake-connector-python[pandas]"
 
-conda install conda-forge::openpyxl
+conda install conda-forge::openpyxl --yes
+conda install anaconda::psycopg2 --yes
+
+conda install conda-forge::dbt-core --yes
+conda install conda-forge::dbt-snowflake --yes
+
