@@ -38,7 +38,6 @@ class TopPostsScraper:
     def get_top_posts(self, subreddit_name, time_filter, max_posts=None, flair_filter=None):
         """
         Get top posts from a subreddit for a specific time period with optional flair filtering.
-        When flair filtering is used, searches "new" posts instead of "top" for better flair filtering.
 
         Args:
             subreddit_name (str): Name of the subreddit (without r/)
@@ -50,11 +49,9 @@ class TopPostsScraper:
             list: List of dictionaries containing post data
         """
         try:
+            logger.info(f"Fetching top posts from r/{subreddit_name} for {time_filter}")
             if flair_filter:
-                logger.info(f"Fetching new posts from r/{subreddit_name} (using 'new' for better flair filtering)")
                 logger.info(f"Filtering by flair: {flair_filter}")
-            else:
-                logger.info(f"Fetching top posts from r/{subreddit_name} for {time_filter}")
 
             # Get subreddit
             subreddit = self.reddit.subreddit(subreddit_name)
@@ -63,14 +60,9 @@ class TopPostsScraper:
             seen_post_ids = set()
             post_count = 0
 
-            # Choose sorting method based on whether flair filtering is used
+            # Get top posts for the specified time period
             try:
-                if flair_filter:
-                    # Use "new" posts for better flair filtering
-                    submissions = subreddit.new(limit=1000)
-                else:
-                    # Use "top" posts for time-based filtering
-                    submissions = subreddit.top(time_filter=time_filter, limit=1000)
+                submissions = subreddit.top(time_filter=time_filter, limit=1000)
                 
                 for submission in submissions:
                     if max_posts and post_count >= max_posts:
@@ -79,13 +71,6 @@ class TopPostsScraper:
                     # Skip if we've already seen this post
                     if submission.id in seen_post_ids:
                         continue
-                    
-                    # When using flair filtering with "new" posts, also filter by time
-                    if flair_filter:
-                        # Check if post is within the specified time period
-                        post_date = datetime.fromtimestamp(submission.created_utc)
-                        if not self._is_within_time_period(post_date, time_filter):
-                            continue
                     
                     # Apply flair filter if specified
                     if flair_filter:
@@ -114,34 +99,6 @@ class TopPostsScraper:
         except Exception as e:
             logger.error(f"Error in get_top_posts: {e}")
             return []
-
-    def _is_within_time_period(self, post_date, time_filter):
-        """
-        Check if a post date is within the specified time period.
-        
-        Args:
-            post_date (datetime): The post's creation date
-            time_filter (str): Time period (hour, day, week, month, year, all)
-            
-        Returns:
-            bool: True if post is within the time period
-        """
-        now = datetime.now()
-        
-        if time_filter == "all":
-            return True
-        elif time_filter == "year":
-            return (now - post_date).days <= 365
-        elif time_filter == "month":
-            return (now - post_date).days <= 30
-        elif time_filter == "week":
-            return (now - post_date).days <= 7
-        elif time_filter == "day":
-            return (now - post_date).days <= 1
-        elif time_filter == "hour":
-            return (now - post_date).total_seconds() <= 3600
-        else:
-            return True
 
     def _extract_post_data(self, submission):
         """Extract relevant data from a Reddit submission."""

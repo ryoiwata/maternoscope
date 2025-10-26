@@ -222,6 +222,7 @@ dbt_maternoscope/logs/
 dbt_maternoscope/.dbt/
 dbt_maternoscope/profiles.yml
 dbt_maternoscope/dbt_project.yml.bak
+dbt_config.md
 
 # DBT profiles (contains sensitive connection info)
 profiles.yml
