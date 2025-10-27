@@ -15,7 +15,7 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
@@ -27,7 +27,7 @@ import hashlib
 # Load environment variables
 load_dotenv()
 
-# Set up logging
+# Default logging setup (will be reconfigured in main with user-specified directory)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -35,7 +35,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Prompt template
-PROMPT_TEMPLATE = """Task: Given a cleaned, redacted Reddit post about pregnancy/maternal care, produce ONE JSON object that includes both topic categorization and a Pomelo-style clinician reply. Extract concise keywords actually present in the text (normalized, lowercase, no stopwords, no duplicates)—e.g., "tylenol", "bleeding", "medicaid".
+PROMPT_TEMPLATE = """Task: Given a cleaned Reddit post about pregnancy or maternal care, produce ONE JSON object that includes:
+1) Topic categorization per the taxonomy below,
+2) A concise factual summary of the post ("post_summary"),
+3) A Pomelo-style clinician reply for Reddit ("care_response").
+
+Extract concise keywords actually present in the text (normalized, lowercase, no stopwords, no duplicates)—for example: "tylenol", "bleeding", "medicaid".
 
 TAXONOMY
 groups:
@@ -54,51 +59,48 @@ groups:
 
 ENUMS
 - primary_group ∈ {{clinical, mental_health, lifestyle_parenting, access_navigation, community_info, meta_context}}
-- primary_topic ∈ the topic list under the chosen group
+- primary_topic ∈ one of the topics listed under its group
 - trimester ∈ {{preconception, first, second, third, postpartum, unknown}}
 - sentiment ∈ {{negative, neutral, positive}}
 - urgency_0_3 ∈ {{0,1,2,3}} (0=routine, 3=urgent)
 
 RULES
 - Choose exactly 1 primary_group and 1 primary_topic (topic must belong to the chosen group).
-- Optionally add up to 3 secondary_topics from ANY group (may be []).
-- Use "unknown" when info is unclear.
-- Confidence is a float in [0,1].
-- Keep notes short (≤200 chars) or "".
+- Optionally add up to 3 secondary_topics from any group (may be []).
+- Use "unknown" if unclear.
+- Keep `notes` short (≤200 chars) or "".
 - Do NOT include the original post text in the JSON.
-- The clinician reply must be placed in `care_response` and follow the safety/persona guidance above.
+- `post_summary` must be a neutral, factual summary (1–3 sentences).
+- `care_response` must be a Pomelo Care clinician reply that meets the persona and safety guidance above.
 
 JSON SCHEMA (keys & types)
 {{
   "post_id": string,
   "primary_group": string,
   "primary_topic": string,
-  "secondary_topics": string[],            // 0-3 items from any group/topic above
+  "secondary_topics": string[],         // 0–3 items
   "trimester": string,
   "sentiment": string,
   "urgency_0_3": integer,
-  "confidence_0_1": number,
-  "keywords": string[],                    // 0–12 normalized tokens present in the post
-  "safety_flags": string[],                // any of: ["misinformation","scope_of_practice","privacy","self_harm","other"]
-  "notes": string,
-  "care_response": string,                 // Pomelo-style Reddit reply text (120–220 words unless safety requires more)
+  "keywords": string[],                 // 0–12 normalized tokens present in the post
+  "safety_flags": string[],             // any of: ["misinformation","scope_of_practice","privacy","self_harm","other"]
+  "post_summary": string,               // factual summary of the Reddit post
+  "notes": string,                      // short reasoning note (≤200 chars)
+  "care_response": string,              // empathetic Pomelo Care reply text for Reddit (120–220 words)
   "model_name": string,
   "model_version": string,
   "prompt_hash": string,
   "input_tokens": integer,
   "output_tokens": integer,
-  "annotated_at": string                   // ISO8601
+  "annotated_at": string                // ISO8601
 }}
 
-Return JSON ONLY. Now annotate and draft the reply:
+Return JSON ONLY. Do not include explanations, prose, or markdown.
+
+Now annotate and reply to this post:
 
 post_id: "{{POST_ID}}"
 post_text: "{{POST_TEXT}}"
-
-optional_hints:
-gestational_stage_hint: "{{GESTATIONAL_STAGE_HINT}}"     // e.g., "first trimester", "postpartum", or "unknown"
-primary_concern_hint:  "{{PRIMARY_CONCERN_HINT}}"        // e.g., "bleeding", "nausea", "insurance"
-cta_link:               "{{CTA_LINK}}"                    // if non-empty, may reference once near the end
 
 """
 
@@ -178,18 +180,19 @@ class LLMAnnotator:
             prompt = PROMPT_TEMPLATE.replace("{{POST_ID}}", post_id).replace("{{POST_TEXT}}", post_text[:2000])  # Limit text length
             
             # Call OpenAI API
-            system_message = """You are a precise clinical text annotator and a Pomelo Care team communicator.
+            system_message = """You are both a precise clinical text annotator and a Pomelo Care clinician communicator.
 Return ONLY valid JSON (no prose, no markdown). If unsure, use "unknown" or [] as specified.
-You must (a) categorize the post per the taxonomy and (b) draft a safe, empathetic Pomelo-style reply for Reddit.
+You must (a) categorize the post per the taxonomy, (b) summarize it objectively, and (c) draft a safe, empathetic Pomelo-style reply for Reddit.
 
-Reply persona & safety:
-- Speak as a member of the Pomelo Care team; warm, inclusive, 6th–8th grade reading level
-- Offer general education and next steps; do NOT diagnose or give dosing/prescriptions
-- Encourage the person to contact their own OB/midwife for individualized advice
-- Escalate clearly if red flags are present (e.g., heavy bleeding, severe pain, severe headache/vision changes, chest pain/SOB, fever ≥100.4°F with severe symptoms, decreased/no fetal movement, suicidal thoughts). For emergencies: advise ER/L&D or local emergency number now
-- Never solicit or include personal identifiers (names, DOB, email, phone, insurance numbers)
-- Keep the Reddit reply ("care_response") to ~120–220 words unless safety requires more
-- Optional, gentle CTA: Pomelo offers 24/7 virtual support with a dedicated team; if eligible through their plan/employer, cost may be $0. Suggest checking eligibility (no promises of eligibility)"""
+Pomelo Care reply persona & safety rules:
+- Speak as a licensed member of the Pomelo Care care team; warm, inclusive, 6th–8th grade reading level.
+- Provide general education and next steps; do NOT diagnose or give dosing/prescriptions.
+- Encourage the poster to contact their own OB-GYN, midwife, or nurse for personalized medical advice.
+- Escalate clearly if red flags are present (e.g., heavy bleeding, severe pain, severe headache or vision changes, chest pain or shortness of breath, fever ≥100.4°F with severe symptoms, decreased/no fetal movement, suicidal thoughts).  
+  → For these, instruct the poster to go to the ER, Labor & Delivery, or call local emergency services immediately.
+- Never solicit or include personal identifiers (names, DOB, phone, email, insurance numbers).
+- The Pomelo Care reply ("care_response") should be ~120–220 words unless more are needed for safety.
+- You may briefly reference Pomelo Care services in a soft, non-sales tone (e.g., 24/7 virtual support, bilingual team, $0 cost for eligible members, fills gaps between OB visits)."""
             
             response = self.openai_client.chat.completions.create(
                 model=self.model_name,
@@ -197,7 +200,6 @@ Reply persona & safety:
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
                 response_format={"type": "json_object"}
             )
             
@@ -211,7 +213,7 @@ Reply persona & safety:
             annotation['prompt_hash'] = self.prompt_hash
             annotation['input_tokens'] = response.usage.prompt_tokens
             annotation['output_tokens'] = response.usage.completion_tokens
-            annotation['annotated_at'] = datetime.utcnow().isoformat() + 'Z'
+            annotation['annotated_at'] = datetime.now(timezone.utc).isoformat()
             
             logger.info(f"Annotated post {post_id} (tokens: {annotation['input_tokens']} + {annotation['output_tokens']})")
             return annotation
@@ -240,11 +242,11 @@ Reply persona & safety:
                 trimester VARCHAR(20),
                 sentiment VARCHAR(20),
                 urgency_0_3 INTEGER,
-                confidence_0_1 FLOAT,
                 keywords ARRAY,
                 safety_flags ARRAY,
-                care_response VARCHAR(2000),
+                post_summary VARCHAR(1000),
                 notes VARCHAR(500),
+                care_response VARCHAR(2000),
                 model_name VARCHAR(100),
                 model_version VARCHAR(50),
                 prompt_hash VARCHAR(50),
@@ -272,10 +274,8 @@ Reply persona & safety:
             # Convert to DataFrame
             df = pd.DataFrame(annotations)
             
-            # Convert array columns to proper format
-            for col in ['secondary_topics', 'keywords', 'safety_flags']:
-                if col in df.columns:
-                    df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, list) else '[]')
+            # Convert column names to UPPERCASE for Snowflake
+            df.columns = [col.upper() for col in df.columns]
             
             # Save to Snowflake
             write_pandas(
@@ -309,8 +309,46 @@ def main():
     parser.add_argument('--limit', type=int, default=10, help='Maximum number of posts to annotate')
     parser.add_argument('--batch-size', type=int, default=10, help='Number of posts to process before saving')
     parser.add_argument('--dry-run', action='store_true', help='Fetch and display posts without annotating')
+    parser.add_argument('--save-csv', action='store_true', help='Save annotations to timestamped CSV file')
+    parser.add_argument('--save-logs', action='store_true', help='Save logs and errors to files')
+    parser.add_argument('--csv-dir', type=str, default='data/processed', help='Directory to save CSV files (default: data/processed)')
+    parser.add_argument('--log-dir', type=str, default='logs/llm', help='Directory to save log files if --save-logs is used (default: logs/llm)')
     
     args = parser.parse_args()
+    
+    # Set up logging with optional file output
+    log_file = None
+    error_file = None
+    
+    if args.save_logs:
+        # Create directory if it doesn't exist
+        os.makedirs(args.log_dir, exist_ok=True)
+        log_file = f"{args.log_dir}/annotate_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+        error_file = f"{args.log_dir}/errors_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+        
+        # Reconfigure logging with file handlers
+        logger.handlers.clear()
+        logger.addHandler(logging.FileHandler(log_file))
+        logger.addHandler(logging.StreamHandler())
+        logger.setLevel(logging.INFO)
+        
+        # Create separate error handler
+        error_handler = logging.FileHandler(error_file)
+        error_handler.setLevel(logging.ERROR)
+        error_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(error_handler)
+        
+        logger.info(f"Log files will be saved to: {args.log_dir}")
+        if log_file:
+            logger.info(f"Log file: {log_file}")
+            logger.info(f"Error log: {error_file}")
+    
+    # Log the command that was run
+    cmd_str = ' '.join(sys.argv)
+    logger.info(f"Command executed: {cmd_str}")
+    logger.info(f"Starting annotation run (limit={args.limit}, batch_size={args.batch_size})")
+    logger.info(f"Log file: {log_file}")
+    logger.info(f"Error log: {error_file}")
     
     # Initialize annotator
     annotator = LLMAnnotator()
@@ -352,8 +390,22 @@ def main():
         # Save remaining annotations
         if annotations:
             annotator.save_annotations(annotations)
+            
+            # Optionally save to CSV file with timestamp
+            if args.save_csv:
+                os.makedirs(args.csv_dir, exist_ok=True)
+                csv_file = f"{args.csv_dir}/annotations_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+                
+                # Save to CSV
+                annotations_df = pd.DataFrame(annotations)
+                annotations_df.to_csv(csv_file, index=False)
+                
+                logger.info(f"Saved {len(annotations)} annotations to {csv_file}")
         
         logger.info("Annotation complete!")
+        if log_file:
+            logger.info(f"Full log available at: {log_file}")
+            logger.info(f"Error log available at: {error_file}")
         
     except Exception as e:
         logger.error(f"Error in main execution: {e}")
