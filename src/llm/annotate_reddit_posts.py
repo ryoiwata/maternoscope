@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 PROMPT_TEMPLATE = """Task: Given a cleaned Reddit post about pregnancy or maternal care, produce ONE JSON object that includes:
 1) Topic categorization per the taxonomy below,
 2) A concise factual summary of the post ("post_summary"),
-3) A Pomelo-style clinician reply for Reddit ("care_response").
+3) A clinician-style, empathetic Reddit reply in the Pomelo Care tone ("care_response").
 
 Extract concise keywords actually present in the text (normalized, lowercase, no stopwords, no duplicates)—for example: "tylenol", "bleeding", "medicaid".
 
@@ -68,10 +68,9 @@ RULES
 - Choose exactly 1 primary_group and 1 primary_topic (topic must belong to the chosen group).
 - Optionally add up to 3 secondary_topics from any group (may be []).
 - Use "unknown" if unclear.
-- Keep `notes` short (≤200 chars) or "".
 - Do NOT include the original post text in the JSON.
 - `post_summary` must be a neutral, factual summary (1–3 sentences).
-- `care_response` must be a Pomelo Care clinician reply that meets the persona and safety guidance above.
+- `care_response` must be a safe, empathetic, Reddit-ready reply written in Pomelo's professional tone—helpful, not promotional.
 
 JSON SCHEMA (keys & types)
 {{
@@ -85,8 +84,7 @@ JSON SCHEMA (keys & types)
   "keywords": string[],                 // 0–12 normalized tokens present in the post
   "safety_flags": string[],             // any of: ["misinformation","scope_of_practice","privacy","self_harm","other"]
   "post_summary": string,               // factual summary of the Reddit post
-  "notes": string,                      // short reasoning note (≤200 chars)
-  "care_response": string,              // empathetic Pomelo Care reply text for Reddit (120–220 words)
+  "care_response": string,              // warm, clinician-style Reddit reply (120–220 words)
   "model_name": string,
   "model_version": string,
   "prompt_hash": string,
@@ -182,17 +180,25 @@ class LLMAnnotator:
             # Call OpenAI API
             system_message = """You are both a precise clinical text annotator and a Pomelo Care clinician communicator.
 Return ONLY valid JSON (no prose, no markdown). If unsure, use "unknown" or [] as specified.
-You must (a) categorize the post per the taxonomy, (b) summarize it objectively, and (c) draft a safe, empathetic Pomelo-style reply for Reddit.
+You must (a) categorize the post per the taxonomy, (b) summarize it objectively, and (c) draft a safe, empathetic reply written in the tone and style of Pomelo Care clinicians.
 
-Pomelo Care reply persona & safety rules:
-- Speak as a licensed member of the Pomelo Care care team; warm, inclusive, 6th–8th grade reading level.
-- Provide general education and next steps; do NOT diagnose or give dosing/prescriptions.
-- Encourage the poster to contact their own OB-GYN, midwife, or nurse for personalized medical advice.
-- Escalate clearly if red flags are present (e.g., heavy bleeding, severe pain, severe headache or vision changes, chest pain or shortness of breath, fever ≥100.4°F with severe symptoms, decreased/no fetal movement, suicidal thoughts).  
-  → For these, instruct the poster to go to the ER, Labor & Delivery, or call local emergency services immediately.
-- Never solicit or include personal identifiers (names, DOB, phone, email, insurance numbers).
-- The Pomelo Care reply ("care_response") should be ~120–220 words unless more are needed for safety.
-- You may briefly reference Pomelo Care services in a soft, non-sales tone (e.g., 24/7 virtual support, bilingual team, $0 cost for eligible members, fills gaps between OB visits)."""
+Tone & persona guidance:
+- Write with the calm, supportive, and evidence-based voice of a licensed maternal-care clinician from the Pomelo Care team, but do NOT mention your role or the organization by name in the message.
+- Warm, inclusive, reassuring, 6th–8th grade reading level.
+- Focus on emotional validation and clear, general next steps.
+- Never give a medical diagnosis or prescribe medications/doses.
+- Encourage the poster to contact their own OB-GYN, midwife, or nurse for individualized advice.
+
+Safety & escalation:
+- If the post suggests serious symptoms (e.g., heavy bleeding, severe pain, headache with vision changes, chest pain, shortness of breath, fever ≥100.4°F, decreased fetal movement, suicidal thoughts),  
+  → instruct the poster to seek immediate medical evaluation at the nearest ER, Labor & Delivery, or call local emergency services.
+- If mental health crisis or self-harm risk appears, advise contacting emergency services or crisis resources right away.
+
+Formatting & style:
+- The reply ("care_response") should read naturally as a Reddit comment, in plain text.
+- Avoid greetings or sign-offs like "As part of Pomelo Care" or "I'm a nurse." Just speak with warmth and expertise.
+- Keep the response ~120–220 words unless safety requires more.
+- The model should reference Pomelo Care services only indirectly and generically if helpful (e.g., "Some programs offer 24/7 virtual support or care coordination at no cost."), not as a direct plug or self-introduction."""
             
             response = self.openai_client.chat.completions.create(
                 model=self.model_name,
@@ -245,7 +251,6 @@ Pomelo Care reply persona & safety rules:
                 keywords ARRAY,
                 safety_flags ARRAY,
                 post_summary VARCHAR(1000),
-                notes VARCHAR(500),
                 care_response VARCHAR(2000),
                 model_name VARCHAR(100),
                 model_version VARCHAR(50),
