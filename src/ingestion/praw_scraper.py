@@ -108,13 +108,19 @@ class TopPostsScraper:
     def _extract_post_data(self, submission):
         """Extract relevant data from a Reddit submission."""
         try:
+            # Get full URL - use permalink for self-posts, url for external links
+            full_url = submission.url
+            if submission.is_self:
+                # For self-posts, construct full reddit URL from permalink
+                full_url = f"https://www.reddit.com{submission.permalink}"
+            
             return {
                 'post_id': submission.id,
                 'post_date': datetime.fromtimestamp(submission.created_utc),
                 'post_timestamp': submission.created_utc,
                 'post_flair': getattr(submission, 'link_flair_text', None),
                 'title': submission.title,
-                'url': submission.url,
+                'url': full_url,
                 'content': submission.selftext if hasattr(submission, 'selftext') else '',
                 'score': submission.score,
                 'num_comments': submission.num_comments,
