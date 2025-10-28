@@ -331,6 +331,15 @@ Tone & persona:
             # Convert to DataFrame
             df = pd.DataFrame(annotations)
             
+            # Sanitize string columns to prevent SQL injection and quote issues
+            string_columns = ['post_summary', 'care_response']
+            for col in string_columns:
+                if col in df.columns:
+                    # Replace problematic characters that could cause SQL issues
+                    df[col] = df[col].astype(str).str.replace('"', "'", regex=False)  # Replace double quotes with single quotes
+                    df[col] = df[col].str.replace('\n', ' ', regex=False)  # Replace newlines with spaces
+                    df[col] = df[col].str.replace('\r', ' ', regex=False)  # Replace carriage returns with spaces
+            
             # Convert column names to UPPERCASE for Snowflake
             df.columns = [col.upper() for col in df.columns]
             
