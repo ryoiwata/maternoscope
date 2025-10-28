@@ -437,25 +437,48 @@ def main():
         
         # Process posts in batches
         annotations = []
+        total_posts = len(posts_df)
+        successful_annotations = 0
+        failed_annotations = 0
+        
         for idx, row in posts_df.iterrows():
             post_id = row['post_id']
             post_text = row['text_for_llm']
             
-            logger.info(f"Annotating post {idx+1}/{len(posts_df)}: {post_id}")
+            logger.info(f"Annotating post {idx+1}/{total_posts}: {post_id}")
             
-            annotation = annotator.annotate_post(post_id, post_text)
-            
-            if annotation:
-                annotations.append(annotation)
-            
-            # Save in batches
-            if len(annotations) >= args.batch_size:
-                annotator.save_annotations(annotations)
-                annotations = []
+            try:
+                annotation = annotator.annotate_post(post_id, post_text)
+                
+                if annotation:
+                    annotations.append(annotation)
+                    successful_annotations += 1
+                    
+                    # Save in batches
+                    if len(annotations) >= args.batch_size:
+                        try:
+                            annotator.save_annotations(annotations)
+                            logger.info(f"Saved batch of {len(annotations)} annotations to Snowflake")
+                        except Exception as save_error:
+                            logger.error(f"Error saving batch to Snowflake: {save_error}")
+                            logger.error(f"Failed to save batch of {len(annotations)} annotations")
+                        finally:
+                            annotations = []
+                
+            except Exception as e:
+                failed_annotations += 1
+                logger.error(f"Error annotating post {post_id}: {e}")
+                logger.error("Continuing with next post...")
+                continue
         
         # Save remaining annotations
         if annotations:
-            annotator.save_annotations(annotations)
+            try:
+                annotator.save_annotations(annotations)
+                logger.info(f"Saved final batch of {len(annotations)} annotations to Snowflake")
+            except Exception as save_error:
+                logger.error(f"Error saving final batch to Snowflake: {save_error}")
+                logger.error(f"Failed to save final batch of {len(annotations)} annotations")
             
             # Optionally save to CSV file with timestamp
             if args.save_csv:
@@ -468,7 +491,12 @@ def main():
                 
                 logger.info(f"Saved {len(annotations)} annotations to {csv_file}")
         
+        logger.info("=" * 50)
         logger.info("Annotation complete!")
+        logger.info(f"Total posts processed: {total_posts}")
+        logger.info(f"Successful annotations: {successful_annotations}")
+        logger.info(f"Failed annotations: {failed_annotations}")
+        logger.info("=" * 50)
         if log_file:
             logger.info(f"Full log available at: {log_file}")
             logger.info(f"Error log available at: {error_file}")
