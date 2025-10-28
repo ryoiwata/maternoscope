@@ -38,9 +38,49 @@ logger = logging.getLogger(__name__)
 PROMPT_TEMPLATE = """Task: Given a cleaned Reddit post about pregnancy or maternal care, produce ONE JSON object that includes:
 1) Topic categorization per the taxonomy below,
 2) A concise factual summary of the post ("post_summary"),
-3) A clinician-style, empathetic Reddit reply in the Pomelo Care tone ("care_response").
+3) A clinician-style, empathetic Reddit reply ("care_response"),
+4) A list of meaningful care-related keywords ("keywords"),
+5) A list of safety or escalation flags ("safety_flags").
 
-Extract concise keywords actually present in the text (normalized, lowercase, no stopwords, no duplicates)—for example: "tylenol", "bleeding", "medicaid".
+---
+
+KEYWORDS  
+Extract 5–20 meaningful tokens that reflect clinical, behavioral, contextual, or social relevance — not filler or emotional words.  
+You may include words from the lists below **plus any other terms the model deems informative for identifying trends or dimensions in pregnancy and maternal care.**  
+This includes emerging medications, health technologies, new policies, social issues, or slang commonly used in patient discussions.
+
+Domains (examples only, not exhaustive):
+1️⃣ Clinical & symptom-related → "bleeding", "cramping", "pain", "spotting", "swelling", "contractions", "nausea", "headache", "preeclampsia", "ultrasound", "hcg", "glucose test", "infection".  
+2️⃣ Medications & labs → "iron", "tylenol", "prenatal vitamin", "magnesium", "zofran", "insulin", "antibiotic", "lab results".  
+3️⃣ Mental health → "anxiety", "depression", "panic", "therapy", "postpartum depression", "lonely", "stressed".  
+4️⃣ Access & insurance → "medicaid", "insurance", "copay", "appointment", "ob-gyn", "midwife", "telehealth", "clinic".  
+5️⃣ Parenting & postpartum → "breastfeeding", "bottle feeding", "sleep", "c-section", "NICU", "pumping", "maternity leave".  
+6️⃣ Policy, geographic & social context → "texas", "rural", "law", "policy", "coverage", "equity", "leave policy".  
+7️⃣ Other emerging, data-relevant, or trend-signaling terms → anything about technology, social barriers, medication shortages, new slang, or community hashtags.
+
+Exclude stopwords, pronouns, and generic filler (e.g., "help," "please," "feel"). Include lowercase, short tokens only.
+
+---
+
+SAFETY FLAGS  
+List all that apply. Use the categories below, adding specific triggers or urgent-care keywords if mentioned.
+
+- "urgent_bleeding" → heavy bleeding, soaking pads, hemorrhage, etc.  
+- "urgent_pain" → severe abdominal, pelvic, or back pain; contractions or cramps suggesting preterm labor.  
+- "urgent_fever_infection" → fever, chills, discharge, infection, wound issues.  
+- "urgent_dizziness_fainting" → fainting, dizziness, low blood pressure, weakness.  
+- "urgent_breathing_chest" → shortness of breath, chest pain, heart racing.  
+- "urgent_fetal_concern" → no or reduced fetal movement, kick count worries.  
+- "urgent_postpartum" → heavy bleeding, severe pain, or fever after delivery.  
+- "mental_health_crisis" → suicidal ideation, panic, hopelessness, severe anxiety.  
+- "miscarriage_or_loss" → miscarriage, pregnancy loss, stillbirth.  
+- "medication_safety" → unsafe drug use, dosing confusion, substance exposure.  
+- "infection_or_sepsis" → uterine infection, endometritis, wound infection.  
+- "other_concern" → other safety-relevant escalation (e.g., swelling, blurred vision, hypertension).
+
+If no urgent or risky content, return an empty array.
+
+---
 
 TAXONOMY
 groups:
@@ -57,43 +97,59 @@ groups:
 - meta_context
   topics: question_seeking_info, experience_sharing_narrative, opinion_rant_vent, announcement_milestone, policy_advocacy_news
 
+---
+
+TRIMESTER ENUM LOGIC  
+- "preconception" → trying to conceive or planning pregnancy  
+- "first", "second", "third" → stated or clearly implied  
+- "pregnant" → clearly pregnant but trimester not specified  
+- "postpartum" → after giving birth  
+- "miscarriage" → discussing pregnancy loss  
+- "unclear" → insufficient info to determine pregnancy status  
+
+---
+
 ENUMS
 - primary_group ∈ {{clinical, mental_health, lifestyle_parenting, access_navigation, community_info, meta_context}}
 - primary_topic ∈ one of the topics listed under its group
-- trimester ∈ {{preconception, first, second, third, postpartum, unknown}}
+- trimester ∈ {{preconception, first, second, third, pregnant, postpartum, miscarriage, unclear}}
 - sentiment ∈ {{negative, neutral, positive}}
 - urgency_0_3 ∈ {{0,1,2,3}} (0=routine, 3=urgent)
 
+---
+
 RULES
-- Choose exactly 1 primary_group and 1 primary_topic (topic must belong to the chosen group).
-- Optionally add up to 3 secondary_topics from any group (may be []).
-- Use "unknown" if unclear.
+- Choose exactly 1 primary_group and 1 primary_topic.
+- Optionally add up to 3 secondary_topics.
+- Use "unknown" or "unclear" when needed.
 - Do NOT include the original post text in the JSON.
 - `post_summary` must be a neutral, factual summary (1–3 sentences).
-- `care_response` must be a safe, empathetic, Reddit-ready reply written in Pomelo's professional tone—helpful, not promotional.
+- `care_response` must be an empathetic, safe Reddit-style clinician reply consistent with Pomelo's tone.
 
-JSON SCHEMA (keys & types)
+---
+
+JSON SCHEMA
 {{
   "post_id": string,
   "primary_group": string,
   "primary_topic": string,
-  "secondary_topics": string[],         // 0–3 items
+  "secondary_topics": string[],          // 0–3 items
   "trimester": string,
   "sentiment": string,
   "urgency_0_3": integer,
-  "keywords": string[],                 // 0–12 normalized tokens present in the post
-  "safety_flags": string[],             // any of: ["misinformation","scope_of_practice","privacy","self_harm","other"]
-  "post_summary": string,               // factual summary of the Reddit post
-  "care_response": string,              // warm, clinician-style Reddit reply (120–220 words)
+  "keywords": string[],                  // 5–20 informative, trend-aware, domain-relevant tokens
+  "safety_flags": string[],              // urgent-care or risk indicators
+  "post_summary": string,                // factual summary of the Reddit post
+  "care_response": string,               // empathetic clinician-style Reddit reply (120–220 words)
   "model_name": string,
   "model_version": string,
   "prompt_hash": string,
   "input_tokens": integer,
   "output_tokens": integer,
-  "annotated_at": string                // ISO8601
+  "annotated_at": string                 // ISO8601
 }}
 
-Return JSON ONLY. Do not include explanations, prose, or markdown.
+Return JSON ONLY. No explanations or markdown.
 
 Now annotate and reply to this post:
 
@@ -180,25 +236,21 @@ class LLMAnnotator:
             # Call OpenAI API
             system_message = """You are both a precise clinical text annotator and a Pomelo Care clinician communicator.
 Return ONLY valid JSON (no prose, no markdown). If unsure, use "unknown" or [] as specified.
-You must (a) categorize the post per the taxonomy, (b) summarize it objectively, and (c) draft a safe, empathetic reply written in the tone and style of Pomelo Care clinicians.
 
-Tone & persona guidance:
-- Write with the calm, supportive, and evidence-based voice of a licensed maternal-care clinician from the Pomelo Care team, but do NOT mention your role or the organization by name in the message.
+Your tasks:
+(a) Categorize the post using the taxonomy.
+(b) Summarize it objectively.
+(c) Generate a safe, empathetic clinician-style Reddit reply in Pomelo Care's tone.
+(d) Extract care-relevant keywords and safety flags for downstream analysis.
+
+Tone & persona:
+- Write in the calm, supportive, and informed tone of a licensed maternal-care clinician.
+- Do NOT introduce yourself or mention any organization.
 - Warm, inclusive, reassuring, 6th–8th grade reading level.
-- Focus on emotional validation and clear, general next steps.
-- Never give a medical diagnosis or prescribe medications/doses.
-- Encourage the poster to contact their own OB-GYN, midwife, or nurse for individualized advice.
-
-Safety & escalation:
-- If the post suggests serious symptoms (e.g., heavy bleeding, severe pain, headache with vision changes, chest pain, shortness of breath, fever ≥100.4°F, decreased fetal movement, suicidal thoughts),  
-  → instruct the poster to seek immediate medical evaluation at the nearest ER, Labor & Delivery, or call local emergency services.
-- If mental health crisis or self-harm risk appears, advise contacting emergency services or crisis resources right away.
-
-Formatting & style:
-- The reply ("care_response") should read naturally as a Reddit comment, in plain text.
-- Avoid greetings or sign-offs like "As part of Pomelo Care" or "I'm a nurse." Just speak with warmth and expertise.
-- Keep the response ~120–220 words unless safety requires more.
-- The model should reference Pomelo Care services only indirectly and generically if helpful (e.g., "Some programs offer 24/7 virtual support or care coordination at no cost."), not as a direct plug or self-introduction."""
+- Provide general, educational guidance; do NOT diagnose or prescribe.
+- Encourage follow-up with their OB-GYN, midwife, or nurse for individualized care.
+- If serious symptoms appear (e.g., heavy bleeding, severe pain, headache with vision changes, fever ≥100.4°F, shortness of breath, chest pain, suicidal thoughts), instruct immediate evaluation at an ER, Labor & Delivery, or local emergency services.
+- If a mental health crisis is implied, recommend emergency or crisis line support."""
             
             response = self.openai_client.chat.completions.create(
                 model=self.model_name,
