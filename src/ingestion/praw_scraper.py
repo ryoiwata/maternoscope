@@ -335,20 +335,14 @@ def main():
             except Exception as e:
                 logger.warning(f"Could not check Snowflake for existing data: {e}")
         
-        # If data exists in either location, ask user what to do
+        # If data exists in either location, log and continue (non-interactive for batch processing)
         if csv_exists or snowflake_exists:
             logger.warning("Existing data found!")
             if csv_exists:
                 logger.warning("  - CSV files exist")
             if snowflake_exists:
                 logger.warning("  - Snowflake data exists")
-            
-            response = input("Do you want to continue scraping anyway? (y/N): ").strip().lower()
-            if response not in ['y', 'yes']:
-                logger.info("Scraping cancelled by user.")
-                return
-            else:
-                logger.info("Continuing with scraping...")
+            logger.warning("Continuing with scraping anyway (batch mode)...")
 
     # Get posts
     posts = scraper.get_top_posts(args.subreddit, args.time_filter, 
