@@ -1,0 +1,78 @@
+version: 2
+
+sources:
+  - name: reddit_raw
+    description: "Raw Reddit posts from scraping operations"
+    database: MATERNOSCOPE
+    schema: INGEST
+    
+    tables:
+      - name: REDDIT_POSTS
+        description: "Raw Reddit posts scraped from pregnancy-related subreddits"
+        columns:
+          - name: POST_ID
+            description: "Unique Reddit post ID"
+          - name: POST_DATE
+            description: "Post creation timestamp"
+          - name: POST_TIMESTAMP
+            description: "Unix timestamp of post"
+          - name: POST_FLAIR
+            description: "Post flair text"
+          - name: TITLE
+            description: "Post title"
+          - name: URL
+            description: "Post URL"
+          - name: CONTENT
+            description: "Post content/selftext"
+          - name: SCORE
+            description: "Post score (upvotes)"
+          - name: NUM_COMMENTS
+            description: "Number of comments"
+          - name: SUBREDDIT
+            description: "Subreddit name"
+          - name: SCRAPED_AT
+            description: "When the data was scraped"
+
+  - name: reddit_annotated
+    description: "LLM-annotated Reddit posts with categorization and care responses"
+    database: MATERNOSCOPE
+    schema: ANALYTICS_ML
+    
+    tables:
+      - name: REDDIT_POSTS_ANNOTATED
+        description: "Reddit posts annotated by LLM with categorization, keywords, safety flags, and care responses"
+        columns:
+          - name: POST_ID
+            description: "Unique Reddit post ID (join key)"
+          - name: PRIMARY_GROUP
+            description: "Primary category group"
+          - name: PRIMARY_TOPIC
+            description: "Primary topic within group"
+          - name: SECONDARY_TOPICS
+            description: "Array of secondary topics"
+          - name: TRIMESTER
+            description: "Pregnancy trimester or stage"
+          - name: SENTIMENT
+            description: "Sentiment of the post"
+          - name: URGENCY_0_3
+            description: "Urgency level (0=routine, 3=urgent)"
+          - name: KEYWORDS
+            description: "Array of extracted keywords"
+          - name: SAFETY_FLAGS
+            description: "Array of safety or escalation flags"
+          - name: POST_SUMMARY
+            description: "Factual summary of the post"
+          - name: CARE_RESPONSE
+            description: "Clinician-style empathetic Reddit reply"
+          - name: MODEL_NAME
+            description: "OpenAI model name used"
+          - name: MODEL_VERSION
+            description: "Model version"
+          - name: PROMPT_HASH
+            description: "Hash of the prompt used"
+          - name: INPUT_TOKENS
+            description: "Number of input tokens"
+          - name: OUTPUT_TOKENS
+            description: "Number of output tokens"
+          - name: ANNOTATED_AT
+            description: "Timestamp when annotation was created"
