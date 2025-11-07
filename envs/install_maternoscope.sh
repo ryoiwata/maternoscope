@@ -92,3 +92,8 @@ conda install conda-forge::airflow --yes
 # Python Reddit API Wrapper - official Reddit API client
 # Install after all other packages for clean dependency tree
 conda install conda-forge::praw --yes
+
+
+conda install conda-forge::streamlit --yes
+
+pip install snowflake-snowpark-python
