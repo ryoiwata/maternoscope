@@ -166,44 +166,10 @@ class TopPostsScraper:
 
 
 class SnowflakeConnector:
-    # Define table schema once - used for both main and staging tables
-    TABLE_SCHEMA = {
-        'POST_ID': 'VARCHAR(255)',
-        'SUBREDDIT': 'VARCHAR(255)',
-        'POST_TITLE': 'VARCHAR(2000)',
-        'POST_CONTENT': 'VARCHAR(16777216)',
-        'POST_URL': 'VARCHAR(2000)',
-        'POST_FLAIR': 'VARCHAR(500)',
-        'SCORE': 'NUMBER',
-        'NUM_COMMENTS': 'NUMBER',
-        'CREATED_UTC': 'TIMESTAMP_NTZ',
-        'POST_TIMESTAMP': 'NUMBER',
-        'SCRAPED_AT': 'TIMESTAMP_TZ',
-        'SCRAPE_DATE': 'DATE'
-    }
-    
     def __init__(self):
         """Initialize Snowflake connection."""
         self.conn = None
         self.connect()
-    
-    def get_table_schema_sql(self, include_primary_key=True):
-        """
-        Generate CREATE TABLE SQL with consistent schema.
-        
-        Args:
-            include_primary_key: If True, adds PRIMARY KEY constraint to POST_ID
-        
-        Returns:
-            str: SQL column definitions
-        """
-        columns = []
-        for col_name, col_type in self.TABLE_SCHEMA.items():
-            if col_name == 'POST_ID' and include_primary_key:
-                columns.append(f"{col_name} {col_type} PRIMARY KEY")
-            else:
-                columns.append(f"{col_name} {col_type}")
-        return ",\n                ".join(columns)
 
     def connect(self):
         """Connect to Snowflake."""
@@ -222,12 +188,8 @@ class SnowflakeConnector:
             logger.error(f"Error connecting to Snowflake: {e}")
             raise
 
-    def create_table_if_not_exists(self, table_name="REDDIT_POSTS"):
-        """
-        Create Snowflake raw table if it doesn't exist.
-        Uses canonical "ever seen" table pattern with post_id as primary key.
-        Also checks if existing table has old schema and handles migration.
-        """
+    def create_table_if_not_exists(self, table_name="top_reddit_posts"):
+        """Create Snowflake table if it doesn't exist."""
         try:
             cursor = self.conn.cursor()
             
@@ -244,71 +206,85 @@ class SnowflakeConnector:
             else:
                 qualified_table_name = f"{database}.{schema}.{table_name}"
             
-            # Check if table exists and get its columns
-            check_table_sql = f"""
-            SELECT COLUMN_NAME 
-            FROM INFORMATION_SCHEMA.COLUMNS 
-            WHERE TABLE_SCHEMA = '{schema}' 
-              AND TABLE_NAME = '{table_name.split('.')[-1]}'
-            ORDER BY ORDINAL_POSITION
+            # Create the table if it doesn't exist using fully qualified name
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {qualified_table_name} (
+                POST_ID VARCHAR(255) PRIMARY KEY,
+                POST_DATE TIMESTAMP_TZ,
+                POST_TIMESTAMP NUMBER,
+                POST_FLAIR VARCHAR(500),
+                TITLE VARCHAR(2000),
+                URL VARCHAR(2000),
+                CONTENT VARCHAR(16777216),
+                SCORE NUMBER,
+                NUM_COMMENTS NUMBER,
+                SUBREDDIT VARCHAR(255),
+                SCRAPED_AT TIMESTAMP_TZ
+            )
             """
-            cursor.execute(check_table_sql)
-            existing_columns = [row[0] for row in cursor.fetchall()]
             
-            if existing_columns:
-                # Table exists - check if it has the new schema
-                has_new_schema = 'POST_TITLE' in existing_columns
-                has_old_schema = 'TITLE' in existing_columns
-                
-                if has_old_schema and not has_new_schema:
-                    logger.warning(f"Table {qualified_table_name} has old schema. Attempting to migrate...")
-                    # Try to add new columns (if they don't exist)
-                    # Note: This is a simple migration - in production you might want more sophisticated handling
-                    try:
-                        alter_sql = f"""
-                        ALTER TABLE {qualified_table_name}
-                        ADD COLUMN IF NOT EXISTS POST_TITLE VARCHAR(2000),
-                        ADD COLUMN IF NOT EXISTS POST_CONTENT VARCHAR(16777216),
-                        ADD COLUMN IF NOT EXISTS POST_URL VARCHAR(2000),
-                        ADD COLUMN IF NOT EXISTS POST_FLAIR VARCHAR(500),
-                        ADD COLUMN IF NOT EXISTS CREATED_UTC TIMESTAMP_NTZ,
-                        ADD COLUMN IF NOT EXISTS POST_TIMESTAMP NUMBER,
-                        ADD COLUMN IF NOT EXISTS SCRAPE_DATE DATE
-                        """
-                        cursor.execute(alter_sql)
-                        logger.info("Added new columns to existing table")
-                    except Exception as e:
-                        logger.warning(f"Could not migrate table schema: {e}")
-                        logger.warning("You may need to manually migrate the table or recreate it")
-                elif has_new_schema:
-                    logger.info(f"Table {qualified_table_name} already has correct schema")
-                else:
-                    logger.info(f"Table {qualified_table_name} exists with unknown schema")
-            else:
-                # Table doesn't exist - create it with new schema
-                schema_sql = self.get_table_schema_sql(include_primary_key=True)
-                create_table_sql = f"""
-                CREATE TABLE {qualified_table_name} (
-                    {schema_sql}
-                )
-                """
-                cursor.execute(create_table_sql)
-                logger.info(f"Created table {qualified_table_name} with new schema")
+            cursor.execute(create_table_sql)
+            logger.info(f"Table {qualified_table_name} created or already exists")
             
             cursor.close()
         except Exception as e:
-            logger.error(f"Error creating/checking table: {e}")
+            logger.error(f"Error creating table: {e}")
             raise
 
-    def save_to_snowflake(self, posts_data, table_name="REDDIT_POSTS", time_filter="unknown"):
+    def get_existing_post_ids(self, table_name="top_reddit_posts", post_ids=None):
         """
-        Save posts data to Snowflake using MERGE pattern for idempotency.
+        Get set of existing POST_IDs from Snowflake table.
         
-        Uses staging table + MERGE to handle:
-        - New posts (insert)
-        - Existing posts (update scores, comment counts, etc.)
-        - Duplicate runs (idempotent)
+        Args:
+            table_name: Name of the table to check
+            post_ids: Optional list of post IDs to check. If None, returns all existing IDs.
+        
+        Returns:
+            set: Set of existing POST_IDs
         """
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get schema and database, and qualify table name
+            schema = os.getenv("SNOWFLAKE_SCHEMA", "INGEST")
+            database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            if '.' in table_name:
+                qualified_table_name = table_name
+            else:
+                qualified_table_name = f"{database}.{schema}.{table_name}"
+            
+            # Ensure schema is set as current schema
+            cursor.execute(f"USE SCHEMA {database}.{schema}")
+            
+            # Build query to check for existing post IDs
+            if post_ids:
+                # Check for specific post IDs
+                placeholders = ','.join(['%s'] * len(post_ids))
+                query = f"""
+                SELECT POST_ID 
+                FROM {qualified_table_name} 
+                WHERE POST_ID IN ({placeholders})
+                """
+                cursor.execute(query, post_ids)
+            else:
+                # Get all existing post IDs
+                query = f"SELECT POST_ID FROM {qualified_table_name}"
+                cursor.execute(query)
+            
+            existing_ids = {row[0] for row in cursor.fetchall()}
+            cursor.close()
+            
+            return existing_ids
+        except Exception as e:
+            # If table doesn't exist yet, return empty set
+            if "does not exist" in str(e) or "Table" in str(e):
+                logger.debug(f"Table {table_name} does not exist yet, no existing IDs")
+                return set()
+            logger.warning(f"Error checking existing post IDs: {e}")
+            return set()
+
+    def save_to_snowflake(self, posts_data, table_name="top_reddit_posts", time_filter="unknown"):
+        """Save posts data to Snowflake, skipping duplicates (idempotent)."""
         try:
             if not posts_data:
                 logger.warning("No data to save to Snowflake")
@@ -319,173 +295,81 @@ class SnowflakeConnector:
             database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
             if '.' in table_name:
                 qualified_table_name = table_name
-                simple_table_name = table_name.split('.')[-1]
             else:
                 qualified_table_name = f"{database}.{schema}.{table_name}"
-                simple_table_name = table_name
-            
-            # Create main table if it doesn't exist
+
+            # Create table if it doesn't exist (pass unqualified name, method will qualify it)
             self.create_table_if_not_exists(table_name)
 
-            # Convert to DataFrame and prepare columns
-            df = pd.DataFrame(posts_data)
+            # Extract post IDs from the data
+            post_ids = [post.get('post_id') for post in posts_data if post.get('post_id')]
             
-            # Map to new schema structure
-            # Add scrape_date (the "day bucket" for this job)
-            scrape_date = datetime.now().date()
-            df['scrape_date'] = scrape_date
-            
-            # Map columns to match new schema
-            column_mapping = {
-                'post_id': 'POST_ID',
-                'subreddit': 'SUBREDDIT',
-                'title': 'POST_TITLE',
-                'content': 'POST_CONTENT',
-                'url': 'POST_URL',
-                'post_flair': 'POST_FLAIR',
-                'score': 'SCORE',
-                'num_comments': 'NUM_COMMENTS',
-                'post_date': 'CREATED_UTC',
-                'post_timestamp': 'POST_TIMESTAMP',
-                'scraped_at': 'SCRAPED_AT',
-                'scrape_date': 'SCRAPE_DATE'
-            }
-            
-            # Create new DataFrame with mapped columns
-            df_mapped = pd.DataFrame()
-            for old_col, new_col in column_mapping.items():
-                if old_col in df.columns:
-                    df_mapped[new_col] = df[old_col]
-            
-            # Ensure timestamps are properly formatted
-            if 'CREATED_UTC' in df_mapped.columns:
-                # CREATED_UTC should be TIMESTAMP_NTZ (no timezone)
-                df_mapped['CREATED_UTC'] = pd.to_datetime(
-                    df_mapped['CREATED_UTC'], utc=True
-                ).dt.tz_localize(None)
-            
-            if 'SCRAPED_AT' in df_mapped.columns:
-                # SCRAPED_AT should be TIMESTAMP_TZ (with timezone)
-                df_mapped['SCRAPED_AT'] = pd.to_datetime(
-                    df_mapped['SCRAPED_AT'], utc=True
-                )
-            
-            if 'SCRAPE_DATE' in df_mapped.columns:
-                df_mapped['SCRAPE_DATE'] = pd.to_datetime(df_mapped['SCRAPED_AT']).dt.date
-            
-            # Ensure all column names are uppercase
-            df_mapped.columns = [col.upper() for col in df_mapped.columns]
-            
-            logger.info(f"Prepared {len(df_mapped)} posts for staging")
-            logger.debug(f"DataFrame columns: {list(df_mapped.columns)}")
+            if not post_ids:
+                logger.warning("No valid post IDs found in data")
+                return
 
-            # Set schema context
+            # Check for existing posts (idempotency check)
+            logger.info("Checking for existing posts in Snowflake...")
+            existing_ids = self.get_existing_post_ids(table_name, post_ids)
+            
+            # Filter out posts that already exist
+            new_posts = [post for post in posts_data 
+                        if post.get('post_id') and post.get('post_id') not in existing_ids]
+            
+            if existing_ids:
+                logger.info(f"Found {len(existing_ids)} existing posts, skipping duplicates")
+            
+            if not new_posts:
+                logger.info(f"All {len(posts_data)} posts already exist in Snowflake. Nothing to insert.")
+                return
+
+            logger.info(f"Inserting {len(new_posts)} new posts (out of {len(posts_data)} total)")
+
+            # Convert to DataFrame
+            df = pd.DataFrame(new_posts)
+            
+            # Ensure post_date is timezone-aware UTC datetime
+            df['post_date'] = pd.to_datetime(df['post_date'], utc=True)
+            df['scraped_at'] = pd.to_datetime(df['scraped_at'], utc=True)
+            
+            # Convert column names to uppercase for Snowflake
+            df.columns = [col.upper() for col in df.columns]
+            
+            logger.debug(f"DataFrame columns: {list(df.columns)}")
+            logger.debug(f"Sample POST_DATE values: {df['POST_DATE'].head().tolist()}")
+            logger.debug(f"POST_DATE dtype: {df['POST_DATE'].dtype}")
+
+            # Set schema context before writing
+            # write_pandas works best with unqualified table names when schema is set
             cursor = self.conn.cursor()
             cursor.execute(f"USE SCHEMA {database}.{schema}")
+            cursor.close()
             
-            # Create or replace staging table (temp table) with same schema as main table
-            # Use the same schema definition to ensure columns match exactly
-            stage_table_name = f"{simple_table_name}_STAGE"
-            qualified_stage_table = f"{database}.{schema}.{stage_table_name}"
+            # Extract just the table name (remove any qualification)
+            simple_table_name = table_name.split('.')[-1] if '.' in table_name else table_name
             
-            logger.info(f"Creating staging table {qualified_stage_table}")
-            # Use same schema but without PRIMARY KEY (staging table doesn't need it)
-            schema_sql = self.get_table_schema_sql(include_primary_key=False)
-            create_stage_sql = f"""
-            CREATE OR REPLACE TEMP TABLE {qualified_stage_table} (
-                {schema_sql}
-            )
-            """
-            cursor.execute(create_stage_sql)
-            
-            # Load data into staging table
-            logger.info(f"Loading {len(df_mapped)} rows into staging table...")
+            # Save to Snowflake using simple table name (schema is already set)
             success, nchunks, nrows, _ = write_pandas(
-                self.conn,
-                df_mapped,
-                stage_table_name,
+                self.conn, 
+                df, 
+                simple_table_name, 
                 auto_create_table=False,
-                overwrite=True,
+                overwrite=False,
                 use_logical_type=True
             )
             
-            if not success:
-                cursor.close()
-                raise Exception("Failed to load data into staging table")
-            
-            logger.info(f"Loaded {nrows} rows into staging table")
-            
-            # Get statistics before MERGE (to know what will be updated vs inserted)
-            stats_sql = f"""
-            SELECT 
-                COUNT(CASE WHEN t.POST_ID IS NOT NULL THEN 1 END) as matched,
-                COUNT(CASE WHEN t.POST_ID IS NULL THEN 1 END) as new
-            FROM {qualified_stage_table} s
-            LEFT JOIN {qualified_table_name} t ON s.POST_ID = t.POST_ID
-            """
-            cursor.execute(stats_sql)
-            stats = cursor.fetchone()
-            matched_count = stats[0] if stats else 0
-            new_count = stats[1] if stats else 0
-            
-            logger.info(f"Pre-merge stats: {matched_count} existing posts will be updated, {new_count} new posts will be inserted")
-            
-            # Perform MERGE to make the job idempotent
-            logger.info("Performing MERGE to update/insert posts...")
-            merge_sql = f"""
-            MERGE INTO {qualified_table_name} t
-            USING {qualified_stage_table} s
-              ON t.POST_ID = s.POST_ID
-            WHEN MATCHED THEN UPDATE SET
-                t.SCORE = s.SCORE,
-                t.NUM_COMMENTS = s.NUM_COMMENTS,
-                t.POST_TITLE = s.POST_TITLE,
-                t.POST_CONTENT = s.POST_CONTENT,
-                t.POST_URL = s.POST_URL,
-                t.POST_FLAIR = s.POST_FLAIR,
-                t.SCRAPED_AT = s.SCRAPED_AT,
-                t.SCRAPE_DATE = s.SCRAPE_DATE
-            WHEN NOT MATCHED THEN INSERT (
-                POST_ID,
-                SUBREDDIT,
-                POST_TITLE,
-                POST_CONTENT,
-                POST_URL,
-                POST_FLAIR,
-                SCORE,
-                NUM_COMMENTS,
-                CREATED_UTC,
-                POST_TIMESTAMP,
-                SCRAPED_AT,
-                SCRAPE_DATE
-            ) VALUES (
-                s.POST_ID,
-                s.SUBREDDIT,
-                s.POST_TITLE,
-                s.POST_CONTENT,
-                s.POST_URL,
-                s.POST_FLAIR,
-                s.SCORE,
-                s.NUM_COMMENTS,
-                s.CREATED_UTC,
-                s.POST_TIMESTAMP,
-                s.SCRAPED_AT,
-                s.SCRAPE_DATE
-            )
-            """
-            
-            cursor.execute(merge_sql)
-            logger.info("MERGE completed successfully")
-            logger.info(f"Final results: {matched_count} posts updated, {new_count} posts inserted")
-            logger.info(f"Total posts processed: {len(df_mapped)}")
-            
-            cursor.close()
+            if success:
+                logger.info(f"Successfully saved {nrows} new rows to Snowflake table {qualified_table_name}")
+                if len(existing_ids) > 0:
+                    logger.info(f"Skipped {len(existing_ids)} duplicate posts")
+            else:
+                logger.error(f"Failed to save data to Snowflake table {qualified_table_name}")
                 
         except Exception as e:
             logger.error(f"Error saving to Snowflake: {e}")
             raise
 
-    def check_existing_data(self, subreddit, time_filter, table_name="REDDIT_POSTS", 
+    def check_existing_data(self, subreddit, time_filter, table_name="top_reddit_posts", 
                            check_recent=False, hours_threshold=24):
         """
         Check if data already exists in Snowflake for this subreddit.
@@ -571,8 +455,8 @@ def main():
     parser.add_argument('--output-json', help='Output JSON filename')
     parser.add_argument('--save-to-snowflake', action='store_true',
                        help='Save data to Snowflake table')
-    parser.add_argument('--snowflake-table', default='REDDIT_POSTS',
-                       help='Snowflake table name (default: REDDIT_POSTS)')
+    parser.add_argument('--snowflake-table', default='top_reddit_posts',
+                       help='Snowflake table name (default: top_reddit_posts)')
     parser.add_argument('--check-duplicates', action='store_true',
                        help='Check for existing data before scraping')
     parser.add_argument('--skip-if-exists', action='store_true',
