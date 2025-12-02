@@ -194,9 +194,22 @@ class SnowflakeConnector:
         try:
             cursor = self.conn.cursor()
             
-            # Create the table if it doesn't exist
+            # Get schema and database from environment
+            schema = os.getenv("SNOWFLAKE_SCHEMA", "INGEST")
+            database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            
+            # Ensure schema is set as current schema (use fully qualified schema name)
+            cursor.execute(f"USE SCHEMA {database}.{schema}")
+            
+            # If table_name already includes schema, use it as-is; otherwise qualify it
+            if '.' in table_name:
+                qualified_table_name = table_name
+            else:
+                qualified_table_name = f"{database}.{schema}.{table_name}"
+            
+            # Create the table if it doesn't exist using fully qualified name
             create_table_sql = f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
+            CREATE TABLE IF NOT EXISTS {qualified_table_name} (
                 POST_ID VARCHAR(255) PRIMARY KEY,
                 POST_DATE TIMESTAMP_TZ,
                 POST_TIMESTAMP NUMBER,
@@ -212,7 +225,7 @@ class SnowflakeConnector:
             """
             
             cursor.execute(create_table_sql)
-            logger.info(f"Table {table_name} created or already exists")
+            logger.info(f"Table {qualified_table_name} created or already exists")
             
             cursor.close()
         except Exception as e:
@@ -226,7 +239,15 @@ class SnowflakeConnector:
                 logger.warning("No data to save to Snowflake")
                 return
 
-            # Create table if it doesn't exist
+            # Get schema and database, and qualify table name
+            schema = os.getenv("SNOWFLAKE_SCHEMA", "INGEST")
+            database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            if '.' in table_name:
+                qualified_table_name = table_name
+            else:
+                qualified_table_name = f"{database}.{schema}.{table_name}"
+
+            # Create table if it doesn't exist (pass unqualified name, method will qualify it)
             self.create_table_if_not_exists(table_name)
 
             # Convert to DataFrame
@@ -243,20 +264,29 @@ class SnowflakeConnector:
             logger.info(f"Sample POST_DATE values: {df['POST_DATE'].head().tolist()}")
             logger.info(f"POST_DATE dtype: {df['POST_DATE'].dtype}")
 
-            # Save to Snowflake
+            # Set schema context before writing
+            # write_pandas works best with unqualified table names when schema is set
+            cursor = self.conn.cursor()
+            cursor.execute(f"USE SCHEMA {database}.{schema}")
+            cursor.close()
+            
+            # Extract just the table name (remove any qualification)
+            simple_table_name = table_name.split('.')[-1] if '.' in table_name else table_name
+            
+            # Save to Snowflake using simple table name (schema is already set)
             success, nchunks, nrows, _ = write_pandas(
                 self.conn, 
                 df, 
-                table_name, 
+                simple_table_name, 
                 auto_create_table=False,
                 overwrite=False,
                 use_logical_type=True
             )
             
             if success:
-                logger.info(f"Successfully saved {nrows} rows to Snowflake table {table_name}")
+                logger.info(f"Successfully saved {nrows} rows to Snowflake table {qualified_table_name}")
             else:
-                logger.error("Failed to save data to Snowflake")
+                logger.error(f"Failed to save data to Snowflake table {qualified_table_name}")
                 
         except Exception as e:
             logger.error(f"Error saving to Snowflake: {e}")
@@ -267,9 +297,20 @@ class SnowflakeConnector:
         try:
             cursor = self.conn.cursor()
             
+            # Get schema and database, and qualify table name
+            schema = os.getenv("SNOWFLAKE_SCHEMA", "INGEST")
+            database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            if '.' in table_name:
+                qualified_table_name = table_name
+            else:
+                qualified_table_name = f"{database}.{schema}.{table_name}"
+            
+            # Ensure schema is set as current schema (use fully qualified schema name)
+            cursor.execute(f"USE SCHEMA {database}.{schema}")
+            
             query = f"""
             SELECT COUNT(*) 
-            FROM {table_name} 
+            FROM {qualified_table_name} 
             WHERE SUBREDDIT = %s
             """
             
