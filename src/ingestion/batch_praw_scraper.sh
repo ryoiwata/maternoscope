@@ -35,6 +35,11 @@ scrape_subreddit() {
     log "=========================================="
     
     # Run the PRAW scraper and capture errors (append to error log)
+    # The scraper uses MERGE pattern for idempotency:
+    # - Loads data into staging table
+    # - MERGE updates existing posts (scores, comments) and inserts new ones
+    # - Safe to run multiple times - no duplicates, always fresh data
+    # Using --check-duplicates to log existing data info
     if python3 "$SCRIPT_DIR/praw_scraper.py" \
         "$subreddit" \
         "$TIME_FILTER" \
