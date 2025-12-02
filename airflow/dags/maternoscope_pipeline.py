@@ -39,7 +39,7 @@ dag = DAG(
     'maternoscope_pipeline',
     default_args=default_args,
     description='MaternoScope Reddit data ingestion and annotation pipeline',
-    schedule_interval='@daily',  # Run daily
+    schedule='@daily',  # Run daily
     catchup=False,
     tags=['maternoscope', 'reddit', 'llm', 'dbt'],
     max_active_runs=1,
