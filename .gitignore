@@ -5,6 +5,7 @@ envs/
 *.json
 old/
 logs/
+*password*
 
 # Data directories
 data/raw/
