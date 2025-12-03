@@ -12,11 +12,20 @@ Excludes: Visualization and Dashboard components
 
 from datetime import timedelta
 from airflow import DAG
-from airflow.operators.python import PythonOperator
 from airflow.models import Variable
 import pendulum
 import os
 import sys
+
+# Import PythonOperator with fallback for compatibility
+try:
+    from airflow.providers.standard.operators.python import (
+        PythonOperator
+    )
+except ImportError:
+    # Fallback for older Airflow versions or if standard providers
+    # not installed
+    from airflow.operators.python import PythonOperator
 
 # Add project root to path for imports
 project_root = os.path.dirname(
