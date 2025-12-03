@@ -13,6 +13,7 @@ Excludes: Visualization and Dashboard components
 from datetime import timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable
 import pendulum
 import os
 import sys
@@ -46,74 +47,32 @@ dag = DAG(
 )
 
 # Configuration - can be overridden via Airflow Variables
-# These can be set in Airflow UI: Admin -> Variables
-REDDIT_SUBREDDITS = [
-    'pregnant', 'BabyBumps', 'pregnancy', 'Mommit', 'beyondthebump'
-]
-REDDIT_TIME_FILTER = 'day'  # hour, day, week, month, year, all
-REDDIT_MAX_POSTS = 1000
-REDDIT_FLAIR_FILTER = None  # Optional flair filter
-# Target table in INGEST schema (full path)
-SNOWFLAKE_TABLE = 'INGEST.REDDIT_POSTS'
-LLM_ANNOTATION_LIMIT = 100  # Number of posts to annotate per run
-LLM_BATCH_SIZE = 20
-DBT_PROJECT_DIR = os.path.join(project_root, 'dbt_maternoscope')
+# Set these in Airflow UI: Admin -> Variables
+# Example: reddit_subreddits = "pregnant,BabyBumps,pregnancy"
 
 
-def scrape_reddit_posts(**context):
-    """
-    Scrape Reddit posts and save to Snowflake.
-    This task runs the praw_scraper.py script for each configured subreddit.
-    """
-    from src.ingestion.praw_scraper import (
-        TopPostsScraper, SnowflakeConnector
-    )
-
-    subreddits = REDDIT_SUBREDDITS
-    time_filter = REDDIT_TIME_FILTER
-    max_posts = REDDIT_MAX_POSTS
-    flair_filter = REDDIT_FLAIR_FILTER
-    table_name = SNOWFLAKE_TABLE
-
-    scraper = TopPostsScraper()
-    snowflake_connector = None
-
+def get_airflow_var(key, default):
+    """Get Airflow Variable or return default."""
     try:
-        snowflake_connector = SnowflakeConnector()
+        return Variable.get(key)
+    except KeyError:
+        return default
 
-        total_posts = 0
-        for subreddit in subreddits:
-            print(f"Scraping r/{subreddit} for {time_filter}...")
 
-            # Get posts
-            posts = scraper.get_top_posts(
-                subreddit_name=subreddit,
-                time_filter=time_filter,
-                max_posts=max_posts,
-                flair_filter=flair_filter
-            )
-
-            if posts:
-                # Save to Snowflake
-                snowflake_connector.save_to_snowflake(
-                    posts_data=posts,
-                    table_name=table_name,
-                    time_filter=time_filter
-                )
-                total_posts += len(posts)
-                print(f"Saved {len(posts)} posts from r/{subreddit}")
-            else:
-                print(f"No posts found for r/{subreddit}")
-
-        print(f"Total posts scraped: {total_posts}")
-        return {'total_posts': total_posts, 'subreddits': subreddits}
-
-    except Exception as e:
-        print(f"Error in scrape_reddit_posts: {e}")
-        raise
-    finally:
-        if snowflake_connector:
-            snowflake_connector.close()
+DEFAULT_SUBREDDITS = (
+    'pregnant,BabyBumps,TryingForABaby,beyondthebump,'
+    'newborns,Miscarriage,NewParents'
+)
+REDDIT_SUBREDDITS = get_airflow_var(
+    'reddit_subreddits', DEFAULT_SUBREDDITS
+).split(',')
+REDDIT_TIME_FILTER = get_airflow_var('reddit_time_filter', 'day')
+REDDIT_MAX_POSTS = int(get_airflow_var('reddit_max_posts', '1000'))
+REDDIT_FLAIR_FILTER = get_airflow_var('reddit_flair_filter', None) or None
+SNOWFLAKE_TABLE = get_airflow_var('snowflake_table', 'top_reddit_posts')
+LLM_ANNOTATION_LIMIT = int(get_airflow_var('llm_annotation_limit', '100'))
+LLM_BATCH_SIZE = int(get_airflow_var('llm_batch_size', '20'))
+DBT_PROJECT_DIR = os.path.join(project_root, 'dbt_maternoscope')
 
 
 def run_dbt_staging(**context):
@@ -203,6 +162,84 @@ def run_dbt_marts(**context):
 
     print(f"dbt marts output: {result.stdout}")
     return result.stdout
+
+
+def scrape_reddit_posts(**context):
+    """
+    Scrape Reddit posts and save to Snowflake.
+    Uses Python scraper directly for better Airflow integration.
+    """
+    from src.ingestion.praw_scraper import (
+        TopPostsScraper, SnowflakeConnector
+    )
+
+    scraper = TopPostsScraper()
+    snowflake_connector = None
+
+    try:
+        snowflake_connector = SnowflakeConnector()
+
+        total_posts = 0
+        successful_subreddits = []
+        failed_subreddits = []
+
+        for subreddit in REDDIT_SUBREDDITS:
+            subreddit = subreddit.strip()
+            if not subreddit:
+                continue
+
+            try:
+                print(f"Scraping r/{subreddit} for {REDDIT_TIME_FILTER}...")
+
+                # Get posts
+                posts = scraper.get_top_posts(
+                    subreddit_name=subreddit,
+                    time_filter=REDDIT_TIME_FILTER,
+                    max_posts=REDDIT_MAX_POSTS,
+                    flair_filter=REDDIT_FLAIR_FILTER
+                )
+
+                if posts:
+                    # Save to Snowflake
+                    snowflake_connector.save_to_snowflake(
+                        posts_data=posts,
+                        table_name=SNOWFLAKE_TABLE,
+                        time_filter=REDDIT_TIME_FILTER
+                    )
+                    total_posts += len(posts)
+                    successful_subreddits.append(subreddit)
+                    print(f"✓ Saved {len(posts)} posts from r/{subreddit}")
+                else:
+                    print(f"⚠ No posts found for r/{subreddit}")
+                    successful_subreddits.append(subreddit)
+
+            except Exception as e:
+                print(f"✗ Error scraping r/{subreddit}: {e}")
+                failed_subreddits.append(subreddit)
+                # Continue with other subreddits instead of failing entire task
+                continue
+
+        print("\n=== Scraping Summary ===")
+        print(f"Total posts scraped: {total_posts}")
+        print(f"Successful subreddits: {len(successful_subreddits)}")
+        print(f"Failed subreddits: {len(failed_subreddits)}")
+        if failed_subreddits:
+            print(f"Failed: {', '.join(failed_subreddits)}")
+
+        # Return summary for downstream tasks
+        return {
+            'total_posts': total_posts,
+            'successful_subreddits': successful_subreddits,
+            'failed_subreddits': failed_subreddits,
+            'subreddit_count': len(REDDIT_SUBREDDITS)
+        }
+
+    except Exception as e:
+        print(f"Error in scrape_reddit_posts: {e}")
+        raise
+    finally:
+        if snowflake_connector:
+            snowflake_connector.close()
 
 
 # Task definitions
