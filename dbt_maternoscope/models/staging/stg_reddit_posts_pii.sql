@@ -5,7 +5,7 @@
 
 with base as (
   select *
-  from {{ ref('stg_reddit_posts') }}
+  from {{ ref('stg_reddit_posts_base') }}
   where post_content_raw is not null
 ),
 
