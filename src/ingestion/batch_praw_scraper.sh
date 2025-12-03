@@ -9,11 +9,19 @@
 export AWS_EC2_METADATA_DISABLED=true
 export BOTO_CONFIG=/dev/null
 
+# Find project root directory (where this script is located)
+# This script is in src/ingestion/, so go up two levels to get project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Change to project root so all relative paths work correctly
+cd "$PROJECT_ROOT" || exit 1
+
 # Configuration
 SUBREDDITS=("pregnant" "BabyBumps" "TryingForABaby" "beyondthebump" "newborns" "Miscarriage" "NewParents")
 TIME_FILTER="day"  # Top posts from past day
 OUTPUT_DIR="data/raw/reddit"
-SCRIPT_DIR="src/ingestion"
+PYTHON_SCRIPT="$SCRIPT_DIR/praw_scraper.py"
 LOG_FILE="logs/ingestion/reddit_scrape_output_$(date +%Y%m%d_%H%M%S).log"
 ERROR_LOG="logs/ingestion/reddit_scrape_errors_$(date +%Y%m%d_%H%M%S).log"
 
@@ -40,12 +48,12 @@ scrape_subreddit() {
     # - MERGE updates existing posts (scores, comments) and inserts new ones
     # - Safe to run multiple times - no duplicates, always fresh data
     # Using --check-duplicates to log existing data info
-    if python3 "$SCRIPT_DIR/praw_scraper.py" \
+    if python3 "$PYTHON_SCRIPT" \
         "$subreddit" \
         "$TIME_FILTER" \
         --output-dir "$OUTPUT_DIR" \
         --save-to-snowflake \
-        --snowflake-table "REDDIT_POSTS" \
+        --snowflake-table "top_reddit_posts" \
         --check-duplicates \
         --verbose 2>>"$ERROR_LOG"; then
         log "Completed scrape for r/$subreddit successfully"

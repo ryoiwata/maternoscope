@@ -6,6 +6,8 @@ envs/
 old/
 logs/
 *password*
+notes.txt
+*copy*
 
 # Data directories
 data/raw/
