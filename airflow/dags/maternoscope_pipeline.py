@@ -13,6 +13,7 @@ Excludes: Visualization and Dashboard components
 from datetime import timedelta
 from airflow import DAG
 from airflow.models import Variable
+from airflow.sdk.exceptions import AirflowRuntimeError
 import pendulum
 import os
 import sys
@@ -64,8 +65,14 @@ def get_airflow_var(key, default):
     """Get Airflow Variable or return default."""
     try:
         return Variable.get(key)
-    except KeyError:
-        return default
+    except (KeyError, AirflowRuntimeError) as e:
+        # Handle both KeyError (older Airflow) and AirflowRuntimeError
+        # (newer Airflow with VARIABLE_NOT_FOUND)
+        error_str = str(e)
+        if isinstance(e, KeyError) or 'VARIABLE_NOT_FOUND' in error_str:
+            return default
+        # Re-raise if it's a different error
+        raise
 
 
 DEFAULT_SUBREDDITS = (
