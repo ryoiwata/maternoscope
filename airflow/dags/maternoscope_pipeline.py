@@ -97,6 +97,10 @@ def run_dbt_staging(**context):
     This runs: stg_reddit_posts and stg_reddit_posts_pii
     """
     import subprocess
+    from dotenv import load_dotenv
+
+    # Load environment variables from .env file
+    load_dotenv(project_root)
 
     # Run dbt for staging models only
     cmd = [
@@ -104,11 +108,15 @@ def run_dbt_staging(**context):
         '--project-dir', DBT_PROJECT_DIR
     ]
 
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        cwd=DBT_PROJECT_DIR
+        cwd=DBT_PROJECT_DIR,
+        env=env
     )
 
     if result.returncode != 0:
@@ -158,6 +166,10 @@ def run_dbt_marts(**context):
     This runs all marts models including fct_reddit_posts_annotated
     """
     import subprocess
+    from dotenv import load_dotenv
+
+    # Load environment variables from .env file
+    load_dotenv(project_root)
 
     # Run dbt for marts models only
     cmd = [
@@ -165,11 +177,15 @@ def run_dbt_marts(**context):
         '--project-dir', DBT_PROJECT_DIR
     ]
 
+    # Pass environment variables to subprocess
+    env = os.environ.copy()
+
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        cwd=DBT_PROJECT_DIR
+        cwd=DBT_PROJECT_DIR,
+        env=env
     )
 
     if result.returncode != 0:
