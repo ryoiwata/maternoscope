@@ -188,7 +188,7 @@ class SnowflakeConnector:
             logger.error(f"Error connecting to Snowflake: {e}")
             raise
 
-    def create_table_if_not_exists(self, table_name="top_reddit_posts"):
+    def create_table_if_not_exists(self, table_name="REDDIT_POSTS"):
         """Create Snowflake table if it doesn't exist."""
         try:
             cursor = self.conn.cursor()
@@ -231,7 +231,7 @@ class SnowflakeConnector:
             logger.error(f"Error creating table: {e}")
             raise
 
-    def get_existing_post_ids(self, table_name="top_reddit_posts", post_ids=None):
+    def get_existing_post_ids(self, table_name="REDDIT_POSTS", post_ids=None):
         """
         Get set of existing POST_IDs from Snowflake table.
         
@@ -283,7 +283,7 @@ class SnowflakeConnector:
             logger.warning(f"Error checking existing post IDs: {e}")
             return set()
 
-    def save_to_snowflake(self, posts_data, table_name="top_reddit_posts", time_filter="unknown"):
+    def save_to_snowflake(self, posts_data, table_name="REDDIT_POSTS", time_filter="unknown"):
         """Save posts data to Snowflake, skipping duplicates (idempotent)."""
         try:
             if not posts_data:
@@ -369,7 +369,7 @@ class SnowflakeConnector:
             logger.error(f"Error saving to Snowflake: {e}")
             raise
 
-    def check_existing_data(self, subreddit, time_filter, table_name="top_reddit_posts", 
+    def check_existing_data(self, subreddit, time_filter, table_name="REDDIT_POSTS", 
                            check_recent=False, hours_threshold=24):
         """
         Check if data already exists in Snowflake for this subreddit.
@@ -455,8 +455,8 @@ def main():
     parser.add_argument('--output-json', help='Output JSON filename')
     parser.add_argument('--save-to-snowflake', action='store_true',
                        help='Save data to Snowflake table')
-    parser.add_argument('--snowflake-table', default='top_reddit_posts',
-                       help='Snowflake table name (default: top_reddit_posts)')
+    parser.add_argument('--snowflake-table', default='REDDIT_POSTS',
+                       help='Snowflake table name (default: REDDIT_POSTS)')
     parser.add_argument('--check-duplicates', action='store_true',
                        help='Check for existing data before scraping')
     parser.add_argument('--skip-if-exists', action='store_true',

@@ -53,7 +53,7 @@ scrape_subreddit() {
         "$TIME_FILTER" \
         --output-dir "$OUTPUT_DIR" \
         --save-to-snowflake \
-        --snowflake-table "top_reddit_posts" \
+        --snowflake-table "REDDIT_POSTS" \
         --check-duplicates \
         --verbose 2>>"$ERROR_LOG"; then
         log "Completed scrape for r/$subreddit successfully"
