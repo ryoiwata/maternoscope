@@ -91,6 +91,26 @@ LLM_BATCH_SIZE = int(get_airflow_var('llm_batch_size', '20'))
 DBT_PROJECT_DIR = os.path.join(project_root, 'dbt_maternoscope')
 
 
+# Find dbt executable - check conda environment first, then system PATH
+def find_dbt_executable():
+    """Find dbt executable in conda environment or system PATH."""
+    import shutil
+
+    # Check conda environment first (most likely location)
+    conda_dbt = os.path.join(
+        project_root, 'envs', 'maternoscope', 'bin', 'dbt'
+    )
+    if os.path.exists(conda_dbt) and os.access(conda_dbt, os.X_OK):
+        return conda_dbt
+
+    # Fall back to system PATH
+    dbt_path = shutil.which('dbt')
+    if dbt_path:
+        return dbt_path
+
+    return None
+
+
 def run_dbt_staging(**context):
     """
     Run dbt staging models to create PII-redacted staging tables.
@@ -100,13 +120,44 @@ def run_dbt_staging(**context):
     from dotenv import load_dotenv
 
     # Load environment variables from .env file
-    load_dotenv(project_root)
+    env_file = os.path.join(project_root, '.env')
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        print(f"✓ Loaded .env file from {env_file}")
+    else:
+        print(f"⚠ Warning: .env file not found at {env_file}")
+
+    # Find dbt executable
+    dbt_path = find_dbt_executable()
+    if not dbt_path:
+        raise Exception(
+            "dbt command not found. Please ensure dbt is installed. "
+            "Expected location: envs/maternoscope/bin/dbt or in system PATH. "
+            "Install with: pip install dbt-snowflake"
+        )
+    print(f"✓ Found dbt at: {dbt_path}")
+
+    # Verify dbt project directory exists
+    if not os.path.exists(DBT_PROJECT_DIR):
+        raise Exception(f"dbt project directory not found: {DBT_PROJECT_DIR}")
+
+    # Check for dbt_project.yml
+    dbt_project_yml = os.path.join(DBT_PROJECT_DIR, 'dbt_project.yml')
+    if not os.path.exists(dbt_project_yml):
+        raise Exception(
+            f"dbt_project.yml not found in: {DBT_PROJECT_DIR}"
+        )
+
+    print(f"✓ Using dbt project directory: {DBT_PROJECT_DIR}")
 
     # Run dbt for staging models only
     cmd = [
-        'dbt', 'run', '--select', 'staging.*',
+        dbt_path, 'run', '--select', 'staging.*',
         '--project-dir', DBT_PROJECT_DIR
     ]
+
+    print(f"Running command: {' '.join(cmd)}")
+    print(f"Working directory: {DBT_PROJECT_DIR}")
 
     # Pass environment variables to subprocess
     env = os.environ.copy()
@@ -119,11 +170,22 @@ def run_dbt_staging(**context):
         env=env
     )
 
-    if result.returncode != 0:
-        print(f"dbt staging error: {result.stderr}")
-        raise Exception(f"dbt staging failed: {result.stderr}")
+    # Print both stdout and stderr for debugging
+    if result.stdout:
+        print("=== dbt stdout ===")
+        print(result.stdout)
+    if result.stderr:
+        print("=== dbt stderr ===")
+        print(result.stderr)
 
-    print(f"dbt staging output: {result.stdout}")
+    if result.returncode != 0:
+        raise Exception(
+            f"dbt staging failed (exit code {result.returncode}):\n"
+            f"STDERR: {result.stderr}\n"
+            f"STDOUT: {result.stdout}"
+        )
+
+    print("✓ dbt staging completed successfully")
     return result.stdout
 
 
@@ -169,13 +231,37 @@ def run_dbt_marts(**context):
     from dotenv import load_dotenv
 
     # Load environment variables from .env file
-    load_dotenv(project_root)
+    env_file = os.path.join(project_root, '.env')
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        print(f"✓ Loaded .env file from {env_file}")
+    else:
+        print(f"⚠ Warning: .env file not found at {env_file}")
+
+    # Find dbt executable
+    dbt_path = find_dbt_executable()
+    if not dbt_path:
+        raise Exception(
+            "dbt command not found. Please ensure dbt is installed. "
+            "Expected location: envs/maternoscope/bin/dbt or in system PATH. "
+            "Install with: pip install dbt-snowflake"
+        )
+    print(f"✓ Found dbt at: {dbt_path}")
+
+    # Verify dbt project directory exists
+    if not os.path.exists(DBT_PROJECT_DIR):
+        raise Exception(f"dbt project directory not found: {DBT_PROJECT_DIR}")
+
+    print(f"✓ Using dbt project directory: {DBT_PROJECT_DIR}")
 
     # Run dbt for marts models only
     cmd = [
-        'dbt', 'run', '--select', 'marts.*',
+        dbt_path, 'run', '--select', 'marts.*',
         '--project-dir', DBT_PROJECT_DIR
     ]
+
+    print(f"Running command: {' '.join(cmd)}")
+    print(f"Working directory: {DBT_PROJECT_DIR}")
 
     # Pass environment variables to subprocess
     env = os.environ.copy()
@@ -188,11 +274,22 @@ def run_dbt_marts(**context):
         env=env
     )
 
-    if result.returncode != 0:
-        print(f"dbt marts error: {result.stderr}")
-        raise Exception(f"dbt marts failed: {result.stderr}")
+    # Print both stdout and stderr for debugging
+    if result.stdout:
+        print("=== dbt stdout ===")
+        print(result.stdout)
+    if result.stderr:
+        print("=== dbt stderr ===")
+        print(result.stderr)
 
-    print(f"dbt marts output: {result.stdout}")
+    if result.returncode != 0:
+        raise Exception(
+            f"dbt marts failed (exit code {result.returncode}):\n"
+            f"STDERR: {result.stderr}\n"
+            f"STDOUT: {result.stdout}"
+        )
+
+    print("✓ dbt marts completed successfully")
     return result.stdout
 
 
