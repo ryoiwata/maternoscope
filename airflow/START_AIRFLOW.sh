@@ -63,6 +63,40 @@ kill_port_processes 8794  # Log server port (triggerer)
 kill_airflow_processes
 
 echo ""
+
+# Clear any blocking DAG runs (if Airflow is already initialized)
+echo "=== Clearing Blocking DAG Runs ==="
+if [ -f "$AIRFLOW_HOME/clear_runs.py" ]; then
+    # Check if Airflow database exists (indicates Airflow is initialized)
+    # Try to run clear_runs.py - it will fail gracefully if DB doesn't exist
+    python3 "$AIRFLOW_HOME/clear_runs.py" <<< "yes" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        echo "   ✓ Blocking runs cleared (if any existed)"
+    else
+        echo "   ℹ Airflow not initialized yet or no blocking runs, skipping cleanup"
+    fi
+else
+    echo "   ⚠ clear_runs.py not found, skipping..."
+fi
+echo ""
+
+# Ensure DAG is ready (unpause if needed)
+echo "=== Ensuring DAG is Ready ==="
+DAG_ID="maternoscope_pipeline"
+# Check if DAG is paused and unpause if needed (only if Airflow is initialized)
+if command -v airflow >/dev/null 2>&1; then
+    DAG_STATE=$(airflow dags state $DAG_ID 2>/dev/null | head -1 || echo "unknown")
+    if echo "$DAG_STATE" | grep -qi "paused\|false"; then
+        echo "   Unpausing DAG..."
+        airflow dags unpause $DAG_ID 2>/dev/null && echo "   ✓ DAG unpaused" || echo "   ⚠ Could not unpause (will try after Airflow starts)"
+    else
+        echo "   ✓ DAG is not paused (or not found yet)"
+    fi
+else
+    echo "   ℹ Airflow command not available yet, will check after startup"
+fi
+echo ""
+
 echo "Starting Airflow standalone..."
 echo "Press Ctrl+C to stop"
 echo ""
