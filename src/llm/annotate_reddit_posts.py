@@ -18,7 +18,6 @@ import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import snowflake.connector
-from snowflake.connector.pandas_tools import write_pandas
 from openai import OpenAI
 import pandas as pd
 from typing import Dict, Any, List
@@ -415,7 +414,9 @@ Tone & persona:
                             return 'ARRAY_CONSTRUCT()'
                         # Escape single quotes in array elements
                         escaped = [str(item).replace("'", "''") for item in arr]
-                        return f"ARRAY_CONSTRUCT({', '.join([f\"'{item}'\" for item in escaped])})"
+                        # Use single quotes in the join to avoid f-string quote issues
+                        quoted_items = [f"'{item}'" for item in escaped]
+                        return f"ARRAY_CONSTRUCT({', '.join(quoted_items)})"
                     
                     secondary_topics = format_array(annotation.get('secondary_topics', []))
                     keywords = format_array(annotation.get('keywords', []))
