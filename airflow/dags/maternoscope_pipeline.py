@@ -87,7 +87,7 @@ REDDIT_MAX_POSTS = int(get_airflow_var('reddit_max_posts', '1000'))
 REDDIT_FLAIR_FILTER = get_airflow_var('reddit_flair_filter', None) or None
 SNOWFLAKE_TABLE = get_airflow_var('snowflake_table', 'REDDIT_POSTS')
 LLM_ANNOTATION_LIMIT = int(get_airflow_var('llm_annotation_limit', '100'))
-LLM_BATCH_SIZE = int(get_airflow_var('llm_batch_size', '20'))
+LLM_BATCH_SIZE = int(get_airflow_var('llm_batch_size', '5'))
 DBT_PROJECT_DIR = os.path.join(project_root, 'dbt_maternoscope')
 
 

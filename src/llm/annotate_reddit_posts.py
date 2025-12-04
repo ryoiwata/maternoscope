@@ -309,6 +309,7 @@ Tone & persona:
                 safety_flags ARRAY,
                 post_summary VARCHAR(1000),
                 care_response VARCHAR(2000),
+                text_for_llm VARCHAR(16777216),
                 model_name VARCHAR(100),
                 model_version VARCHAR(50),
                 prompt_hash VARCHAR(50),
@@ -317,6 +318,30 @@ Tone & persona:
                 annotated_at TIMESTAMP_TZ
             )
             """
+            
+            cursor.execute(create_table_sql)
+            
+            # Check if text_for_llm column exists and add it if missing (for existing tables)
+            try:
+                check_column_sql = """
+                SELECT COUNT(*) 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_SCHEMA = 'ANALYTICS_ML' 
+                AND TABLE_NAME = 'REDDIT_POSTS_ANNOTATED' 
+                AND COLUMN_NAME = 'TEXT_FOR_LLM'
+                """
+                cursor.execute(check_column_sql)
+                column_exists = cursor.fetchone()[0] > 0
+                
+                if not column_exists:
+                    alter_table_sql = """
+                    ALTER TABLE ANALYTICS_ML.REDDIT_POSTS_ANNOTATED 
+                    ADD COLUMN text_for_llm VARCHAR(16777216)
+                    """
+                    cursor.execute(alter_table_sql)
+                    logger.info("Added text_for_llm column to existing table")
+            except Exception as e:
+                logger.warning(f"Could not check/add text_for_llm column: {e}")
             
             cursor.execute(create_table_sql)
             cursor.close()
@@ -338,7 +363,7 @@ Tone & persona:
             df = pd.DataFrame(annotations)
             
             # Sanitize string columns to prevent SQL injection and quote issues
-            string_columns = ['post_summary', 'care_response']
+            string_columns = ['post_summary', 'care_response', 'text_for_llm']
             for col in string_columns:
                 if col in df.columns:
                     # Replace problematic characters that could cause SQL issues
@@ -457,6 +482,8 @@ def main():
                 annotation = annotator.annotate_post(post_id, post_text)
                 
                 if annotation:
+                    # Add text_for_llm to the annotation before saving
+                    annotation['text_for_llm'] = post_text
                     annotations.append(annotation)
                     successful_annotations += 1
                     
