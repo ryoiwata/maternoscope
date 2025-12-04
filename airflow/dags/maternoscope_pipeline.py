@@ -86,9 +86,7 @@ REDDIT_TIME_FILTER = get_airflow_var('reddit_time_filter', 'day')
 REDDIT_MAX_POSTS = int(get_airflow_var('reddit_max_posts', '1000'))
 REDDIT_FLAIR_FILTER = get_airflow_var('reddit_flair_filter', None) or None
 SNOWFLAKE_TABLE = get_airflow_var('snowflake_table', 'REDDIT_POSTS')
-# LLM_ANNOTATION_LIMIT: None means no limit, otherwise use the value
-llm_limit_str = get_airflow_var('llm_annotation_limit', None)
-LLM_ANNOTATION_LIMIT = int(llm_limit_str) if llm_limit_str else None
+LLM_ANNOTATION_LIMIT = int(get_airflow_var('llm_annotation_limit', '100'))
 LLM_BATCH_SIZE = int(get_airflow_var('llm_batch_size', '20'))
 DBT_PROJECT_DIR = os.path.join(project_root, 'dbt_maternoscope')
 
@@ -96,19 +94,13 @@ DBT_PROJECT_DIR = os.path.join(project_root, 'dbt_maternoscope')
 def run_dbt_staging(**context):
     """
     Run dbt staging models to create PII-redacted staging tables.
-    This runs: stg_reddit_posts_base and stg_reddit_posts_pii
+    This runs: stg_reddit_posts and stg_reddit_posts_pii
     """
     import subprocess
     from dotenv import load_dotenv
 
     # Load environment variables from .env file
-    # override=True ensures variables are loaded
-    env_file = os.path.join(project_root, '.env')
-    if os.path.exists(env_file):
-        load_dotenv(env_file, override=True)
-        print(f"Loaded environment variables from {env_file}")
-    else:
-        print(f"Warning: .env file not found at {env_file}")
+    load_dotenv(project_root)
 
     # Run dbt for staging models only
     cmd = [
@@ -119,24 +111,6 @@ def run_dbt_staging(**context):
     # Pass environment variables to subprocess
     env = os.environ.copy()
 
-    # Verify critical variables are set
-    required_vars = [
-        'SNOWFLAKE_ACCOUNT',
-        'SNOWFLAKE_USERNAME',
-        'SNOWFLAKE_PASSWORD'
-    ]
-    missing_vars = [
-        var for var in required_vars
-        if var not in env or not env[var]
-    ]
-    if missing_vars:
-        print(f"Warning: Missing env vars: {missing_vars}")
-        snowflake_vars = [
-            k for k in env.keys()
-            if k.startswith('SNOWFLAKE_')
-        ]
-        print(f"Available SNOWFLAKE_* vars: {snowflake_vars}")
-
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -146,13 +120,8 @@ def run_dbt_staging(**context):
     )
 
     if result.returncode != 0:
-        print(f"dbt staging stdout: {result.stdout}")
-        print(f"dbt staging stderr: {result.stderr}")
-        print(f"dbt return code: {result.returncode}")
-        raise Exception(
-            f"dbt staging failed (return code {result.returncode}):\n"
-            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        )
+        print(f"dbt staging error: {result.stderr}")
+        raise Exception(f"dbt staging failed: {result.stderr}")
 
     print(f"dbt staging output: {result.stdout}")
     return result.stdout
@@ -171,13 +140,10 @@ def annotate_posts_with_llm(**context):
 
     cmd = [
         'python', script_path,
+        '--limit', str(LLM_ANNOTATION_LIMIT),
         '--batch-size', str(LLM_BATCH_SIZE),
         '--save-logs'
     ]
-
-    # Only add --limit if a limit is specified
-    if LLM_ANNOTATION_LIMIT is not None:
-        cmd.extend(['--limit', str(LLM_ANNOTATION_LIMIT)])
 
     result = subprocess.run(
         cmd,
@@ -203,13 +169,7 @@ def run_dbt_marts(**context):
     from dotenv import load_dotenv
 
     # Load environment variables from .env file
-    # override=True ensures variables are loaded
-    env_file = os.path.join(project_root, '.env')
-    if os.path.exists(env_file):
-        load_dotenv(env_file, override=True)
-        print(f"Loaded environment variables from {env_file}")
-    else:
-        print(f"Warning: .env file not found at {env_file}")
+    load_dotenv(project_root)
 
     # Run dbt for marts models only
     cmd = [
@@ -219,24 +179,6 @@ def run_dbt_marts(**context):
 
     # Pass environment variables to subprocess
     env = os.environ.copy()
-
-    # Verify critical variables are set
-    required_vars = [
-        'SNOWFLAKE_ACCOUNT',
-        'SNOWFLAKE_USERNAME',
-        'SNOWFLAKE_PASSWORD'
-    ]
-    missing_vars = [
-        var for var in required_vars
-        if var not in env or not env[var]
-    ]
-    if missing_vars:
-        print(f"Warning: Missing env vars: {missing_vars}")
-        snowflake_vars = [
-            k for k in env.keys()
-            if k.startswith('SNOWFLAKE_')
-        ]
-        print(f"Available SNOWFLAKE_* vars: {snowflake_vars}")
 
     result = subprocess.run(
         cmd,
