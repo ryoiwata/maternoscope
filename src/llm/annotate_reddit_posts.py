@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
 from openai import OpenAI
 import pandas as pd
 from typing import Dict, Any, List
@@ -197,37 +198,30 @@ class LLMAnnotator:
             raise
     
     def fetch_posts_to_annotate(self, limit: int = None) -> pd.DataFrame:
-        """Fetch posts that need annotation from Snowflake.
-        Excludes posts already annotated with the same model and prompt."""
+        """Fetch posts that need annotation from Snowflake."""
         try:
             # Use BRONZE schema (matches dbt staging models)
             database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
-            model_name = self.model_name
-            prompt_hash = self.prompt_hash
-            
             query = f"""
             SELECT 
-                p.post_id,
-                p.text_for_llm,
-                p.text_raw
-            FROM {database}.BRONZE.STG_REDDIT_POSTS_PII p
-            WHERE p.needs_annotation = TRUE
-            AND NOT EXISTS (
-                SELECT 1 
-                FROM {database}.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED a
-                WHERE a.post_id = p.post_id
-                AND a.model_name = '{model_name}'
-                AND a.prompt_hash = '{prompt_hash}'
+                post_id,
+                text_for_llm,
+                text_raw
+            FROM {database}.BRONZE.STG_REDDIT_POSTS_PII
+            WHERE needs_annotation = TRUE
+            AND post_id NOT IN (
+                SELECT DISTINCT post_id 
+                FROM {database}.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED
             )
             """
             
             if limit:
                 query += f" LIMIT {limit}"
             
-            logger.info(
-                f"Fetching posts to annotate (limit={limit}, "
-                f"model={model_name}, prompt_hash={prompt_hash[:8]}...)..."
-            )
+            if limit:
+                logger.info(f"Fetching posts to annotate (limit={limit})...")
+            else:
+                logger.info("Fetching all posts to annotate (no limit)...")
             df = pd.read_sql(query, self.snowflake_conn)
             # Snowflake returns uppercase column names, convert to lowercase
             df.columns = [col.lower() for col in df.columns]
@@ -302,11 +296,9 @@ Tone & persona:
             logger.info("Schema ANALYTICS_ML created or already exists")
             
             # Create table
-            # Note: Using composite unique key (post_id, model_name, prompt_hash)
-            # to allow multiple annotations per post with different models/prompts
             create_table_sql = """
             CREATE TABLE IF NOT EXISTS ANALYTICS_ML.REDDIT_POSTS_ANNOTATED (
-                post_id VARCHAR(255),
+                post_id VARCHAR(255) PRIMARY KEY,
                 primary_group VARCHAR(50),
                 primary_topic VARCHAR(100),
                 secondary_topics ARRAY,
@@ -317,68 +309,16 @@ Tone & persona:
                 safety_flags ARRAY,
                 post_summary VARCHAR(1000),
                 care_response VARCHAR(2000),
-                text_for_llm VARCHAR(16777216),
                 model_name VARCHAR(100),
                 model_version VARCHAR(50),
                 prompt_hash VARCHAR(50),
                 input_tokens INTEGER,
                 output_tokens INTEGER,
-                annotated_at TIMESTAMP_TZ,
-                PRIMARY KEY (post_id, model_name, prompt_hash)
+                annotated_at TIMESTAMP_TZ
             )
             """
             
             cursor.execute(create_table_sql)
-            
-            # Check if table exists and needs migration
-            try:
-                # Check if text_for_llm column exists
-                check_column_sql = """
-                SELECT COUNT(*) 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_SCHEMA = 'ANALYTICS_ML' 
-                AND TABLE_NAME = 'REDDIT_POSTS_ANNOTATED' 
-                AND COLUMN_NAME = 'TEXT_FOR_LLM'
-                """
-                cursor.execute(check_column_sql)
-                column_exists = cursor.fetchone()[0] > 0
-                
-                if not column_exists:
-                    alter_table_sql = """
-                    ALTER TABLE ANALYTICS_ML.REDDIT_POSTS_ANNOTATED 
-                    ADD COLUMN text_for_llm VARCHAR(16777216)
-                    """
-                    cursor.execute(alter_table_sql)
-                    logger.info("Added text_for_llm column to existing table")
-                
-                # Check if primary key is composite (post_id, model_name, prompt_hash)
-                # If not, we'll use MERGE which will work but only allow one annotation per post_id
-                check_pk_sql = """
-                SELECT COUNT(*) 
-                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-                    ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-                WHERE tc.TABLE_SCHEMA = 'ANALYTICS_ML'
-                AND tc.TABLE_NAME = 'REDDIT_POSTS_ANNOTATED'
-                AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-                AND kcu.COLUMN_NAME IN ('POST_ID', 'MODEL_NAME', 'PROMPT_HASH')
-                GROUP BY tc.CONSTRAINT_NAME
-                HAVING COUNT(DISTINCT kcu.COLUMN_NAME) = 3
-                """
-                cursor.execute(check_pk_sql)
-                has_composite_pk = cursor.fetchone()[0] > 0 if cursor.rowcount > 0 else False
-                
-                if not has_composite_pk:
-                    logger.warning(
-                        "Table exists with old PRIMARY KEY (post_id only). "
-                        "MERGE will work but only one annotation per post_id is allowed. "
-                        "Consider recreating table with composite PRIMARY KEY for full idempotency."
-                    )
-                    
-            except Exception as e:
-                # If checks fail, table might not exist yet or permission issue
-                logger.warning(f"Could not check table schema: {e}")
-            
             cursor.close()
             logger.info("Annotation table created or already exists")
             
@@ -394,111 +334,33 @@ Tone & persona:
             return
         
         try:
-            cursor = self.snowflake_conn.cursor()
-            database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            # Convert to DataFrame
+            df = pd.DataFrame(annotations)
             
-            # Process each annotation with MERGE for idempotency
-            saved_count = 0
-            skipped_count = 0
+            # Sanitize string columns to prevent SQL injection and quote issues
+            string_columns = ['post_summary', 'care_response']
+            for col in string_columns:
+                if col in df.columns:
+                    # Replace problematic characters that could cause SQL issues
+                    df[col] = df[col].astype(str).str.replace('"', "'", regex=False)  # Replace double quotes with single quotes
+                    df[col] = df[col].str.replace('\n', ' ', regex=False)  # Replace newlines with spaces
+                    df[col] = df[col].str.replace('\r', ' ', regex=False)  # Replace carriage returns with spaces
             
-            for annotation in annotations:
-                try:
-                    # Sanitize string values
-                    post_summary = str(annotation.get('post_summary', '')).replace("'", "''").replace('\n', ' ').replace('\r', ' ')
-                    care_response = str(annotation.get('care_response', '')).replace("'", "''").replace('\n', ' ').replace('\r', ' ')
-                    text_for_llm = str(annotation.get('text_for_llm', '')).replace("'", "''").replace('\n', ' ').replace('\r', ' ')
-                    
-                    # Format arrays for Snowflake
-                    def format_array(arr):
-                        if not arr:
-                            return 'ARRAY_CONSTRUCT()'
-                        # Escape single quotes in array elements
-                        escaped = [str(item).replace("'", "''") for item in arr]
-                        # Use single quotes in the join to avoid f-string quote issues
-                        quoted_items = [f"'{item}'" for item in escaped]
-                        return f"ARRAY_CONSTRUCT({', '.join(quoted_items)})"
-                    
-                    secondary_topics = format_array(annotation.get('secondary_topics', []))
-                    keywords = format_array(annotation.get('keywords', []))
-                    safety_flags = format_array(annotation.get('safety_flags', []))
-                    
-                    # MERGE statement for idempotent upsert
-                    merge_sql = f"""
-                    MERGE INTO {database}.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED AS target
-                    USING (
-                        SELECT
-                            '{annotation.get('post_id')}' AS post_id,
-                            '{annotation.get('primary_group', '')}' AS primary_group,
-                            '{annotation.get('primary_topic', '')}' AS primary_topic,
-                            {secondary_topics} AS secondary_topics,
-                            '{annotation.get('trimester', '')}' AS trimester,
-                            '{annotation.get('sentiment', '')}' AS sentiment,
-                            {annotation.get('urgency_0_3', 0)} AS urgency_0_3,
-                            {keywords} AS keywords,
-                            {safety_flags} AS safety_flags,
-                            '{post_summary}' AS post_summary,
-                            '{care_response}' AS care_response,
-                            '{text_for_llm}' AS text_for_llm,
-                            '{annotation.get('model_name', '')}' AS model_name,
-                            '{annotation.get('model_version', '')}' AS model_version,
-                            '{annotation.get('prompt_hash', '')}' AS prompt_hash,
-                            {annotation.get('input_tokens', 0)} AS input_tokens,
-                            {annotation.get('output_tokens', 0)} AS output_tokens,
-                            '{annotation.get('annotated_at', '')}' AS annotated_at
-                    ) AS source
-                    ON target.post_id = source.post_id
-                       AND target.model_name = source.model_name
-                       AND target.prompt_hash = source.prompt_hash
-                    WHEN MATCHED THEN
-                        UPDATE SET
-                            primary_group = source.primary_group,
-                            primary_topic = source.primary_topic,
-                            secondary_topics = source.secondary_topics,
-                            trimester = source.trimester,
-                            sentiment = source.sentiment,
-                            urgency_0_3 = source.urgency_0_3,
-                            keywords = source.keywords,
-                            safety_flags = source.safety_flags,
-                            post_summary = source.post_summary,
-                            care_response = source.care_response,
-                            text_for_llm = source.text_for_llm,
-                            model_version = source.model_version,
-                            input_tokens = source.input_tokens,
-                            output_tokens = source.output_tokens,
-                            annotated_at = source.annotated_at
-                    WHEN NOT MATCHED THEN
-                        INSERT (
-                            post_id, primary_group, primary_topic, secondary_topics,
-                            trimester, sentiment, urgency_0_3, keywords, safety_flags,
-                            post_summary, care_response, text_for_llm,
-                            model_name, model_version, prompt_hash,
-                            input_tokens, output_tokens, annotated_at
-                        )
-                        VALUES (
-                            source.post_id, source.primary_group, source.primary_topic,
-                            source.secondary_topics, source.trimester, source.sentiment,
-                            source.urgency_0_3, source.keywords, source.safety_flags,
-                            source.post_summary, source.care_response, source.text_for_llm,
-                            source.model_name, source.model_version, source.prompt_hash,
-                            source.input_tokens, source.output_tokens, source.annotated_at
-                        )
-                    """
-                    
-                    cursor.execute(merge_sql)
-                    saved_count += 1
-                    
-                except Exception as e:
-                    logger.warning(
-                        f"Error saving annotation for post_id {annotation.get('post_id')}: {e}"
-                    )
-                    skipped_count += 1
-                    continue
+            # Convert column names to UPPERCASE for Snowflake
+            df.columns = [col.upper() for col in df.columns]
             
-            cursor.close()
-            logger.info(
-                f"Saved {saved_count} annotations to Snowflake "
-                f"(skipped {skipped_count} due to errors)"
+            # Save to Snowflake
+            write_pandas(
+                self.snowflake_conn,
+                df,
+                'REDDIT_POSTS_ANNOTATED',
+                auto_create_table=False,
+                overwrite=False,
+                use_logical_type=True,
+                schema='ANALYTICS_ML'
             )
+            
+            logger.info(f"Saved {len(annotations)} annotations to Snowflake")
             
         except Exception as e:
             logger.error(f"Error saving annotations: {e}")
@@ -516,7 +378,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Annotate Reddit posts using OpenAI')
-    parser.add_argument('--limit', type=int, default=None, help='Maximum number of posts to annotate (default: no limit)')
+    parser.add_argument('--limit', type=int, default=None, help='Maximum number of posts to annotate (default: no limit, annotate all)')
     parser.add_argument('--batch-size', type=int, default=10, help='Number of posts to process before saving')
     parser.add_argument('--dry-run', action='store_true', help='Fetch and display posts without annotating')
     parser.add_argument('--save-csv', action='store_true', help='Save annotations to timestamped CSV file')
@@ -595,8 +457,6 @@ def main():
                 annotation = annotator.annotate_post(post_id, post_text)
                 
                 if annotation:
-                    # Add text_for_llm to the annotation before saving
-                    annotation['text_for_llm'] = post_text
                     annotations.append(annotation)
                     successful_annotations += 1
                     

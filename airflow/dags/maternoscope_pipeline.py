@@ -193,19 +193,36 @@ def annotate_posts_with_llm(**context):
     """
     Run LLM annotation on posts that need annotation.
     This task runs the annotate_reddit_posts.py script.
+
+    Features:
+    - No limit on number of posts (processes all posts needing annotation)
+    - Idempotent (uses MERGE to avoid duplicates)
+    - Saves cleaned post text (text_for_llm) in output table
     """
     import subprocess
+    from dotenv import load_dotenv
+
+    # Load environment variables from .env file
+    env_file = os.path.join(project_root, '.env')
+    if os.path.exists(env_file):
+        load_dotenv(env_file)
+        print(f"✓ Loaded .env file from {env_file}")
+    else:
+        print(f"⚠ Warning: .env file not found at {env_file}")
 
     script_path = os.path.join(
         project_root, 'src', 'llm', 'annotate_reddit_posts.py'
     )
 
+    # No --limit flag - process all posts needing annotation by default
     cmd = [
         'python', script_path,
-        '--limit', str(LLM_ANNOTATION_LIMIT),
         '--batch-size', str(LLM_BATCH_SIZE),
         '--save-logs'
     ]
+
+    print("Running LLM annotation (no limit - processing all posts)")
+    print(f"Command: {' '.join(cmd)}")
 
     result = subprocess.run(
         cmd,
@@ -214,11 +231,22 @@ def annotate_posts_with_llm(**context):
         cwd=project_root
     )
 
-    if result.returncode != 0:
-        print(f"LLM annotation error: {result.stderr}")
-        raise Exception(f"LLM annotation failed: {result.stderr}")
+    # Print output for debugging
+    if result.stdout:
+        print("=== LLM annotation stdout ===")
+        print(result.stdout)
+    if result.stderr:
+        print("=== LLM annotation stderr ===")
+        print(result.stderr)
 
-    print(f"LLM annotation output: {result.stdout}")
+    if result.returncode != 0:
+        raise Exception(
+            f"LLM annotation failed (exit code {result.returncode}):\n"
+            f"STDERR: {result.stderr}\n"
+            f"STDOUT: {result.stdout}"
+        )
+
+    print("✓ LLM annotation completed successfully")
     return result.stdout
 
 
