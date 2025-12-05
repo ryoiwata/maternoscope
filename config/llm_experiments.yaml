@@ -1,6 +1,6 @@
 default_run:
   model_name: "gpt-4o-mini"
   system_prompt_file: "prompts/clinical_annotation_system_v1_0.txt"
-  user_prompt_file: "prompts/clinical_annotation_user_v1_1.txt"
+  user_prompt_file: "prompts/clinical_annotation_user_v1_2.txt"
   version: "1.0.0"
 
