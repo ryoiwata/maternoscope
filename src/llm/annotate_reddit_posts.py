@@ -133,30 +133,48 @@ class LLMAnnotator:
             raise
     
     def fetch_posts_to_annotate(self, limit: int = None) -> pd.DataFrame:
-        """Fetch posts that need annotation from Snowflake."""
+        """Fetch posts that need annotation from Snowflake.
+        
+        Uses LEFT JOIN with compound key (post_id, model_name, prompt_hash)
+        to implement idempotent read logic. Only returns posts that don't
+        have an existing annotation with the current model and prompt version.
+        """
         try:
             # Use BRONZE schema (matches dbt staging models)
             database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            
+            # Safely escape model_name and prompt_hash for SQL
+            model_name_escaped = self.model_name.replace("'", "''")
+            prompt_hash_escaped = self.prompt_hash.replace("'", "''")
+            
+            # Use LEFT JOIN with compound key for idempotent filtering
             query = f"""
             SELECT 
-                post_id,
-                text_for_llm,
-                text_raw
-            FROM {database}.BRONZE.STG_REDDIT_POSTS_PII
-            WHERE needs_annotation = TRUE
-            AND post_id NOT IN (
-                SELECT DISTINCT post_id 
-                FROM {database}.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED
-            )
+                t1.post_id,
+                t1.text_for_llm,
+                t1.text_raw
+            FROM {database}.BRONZE.STG_REDDIT_POSTS_PII t1
+            LEFT JOIN {database}.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED t2
+                ON t1.post_id = t2.post_id
+                AND t2.model_name = '{model_name_escaped}'
+                AND t2.prompt_hash = '{prompt_hash_escaped}'
+            WHERE t1.needs_annotation = TRUE
+                AND t2.post_id IS NULL
             """
             
             if limit:
                 query += f" LIMIT {limit}"
             
             if limit:
-                logger.info(f"Fetching posts to annotate (limit={limit})...")
+                logger.info(
+                    f"Fetching posts to annotate (limit={limit}, "
+                    f"model={self.model_name}, prompt_hash={self.prompt_hash[:8]}...)..."
+                )
             else:
-                logger.info("Fetching all posts to annotate (no limit)...")
+                logger.info(
+                    f"Fetching all posts to annotate (no limit, "
+                    f"model={self.model_name}, prompt_hash={self.prompt_hash[:8]}...)..."
+                )
             df = pd.read_sql(query, self.snowflake_conn)
             # Snowflake returns uppercase column names, convert to lowercase
             df.columns = [col.lower() for col in df.columns]
@@ -221,6 +239,8 @@ class LLMAnnotator:
             logger.info("Schema ANALYTICS_ML created or already exists")
             
             # Create table
+            # Note: Primary key is on post_id only, but idempotency is enforced
+            # via MERGE using compound key (post_id, model_name, prompt_hash)
             create_table_sql = """
             CREATE TABLE IF NOT EXISTS ANALYTICS_ML.REDDIT_POSTS_ANNOTATED (
                 post_id VARCHAR(255) PRIMARY KEY,
@@ -246,31 +266,38 @@ class LLMAnnotator:
             
             cursor.execute(create_table_sql)
             
-            # Check if text_for_llm column exists and add it if missing (for existing tables)
-            try:
-                check_column_sql = """
-                SELECT COUNT(*) 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_SCHEMA = 'ANALYTICS_ML' 
-                AND TABLE_NAME = 'REDDIT_POSTS_ANNOTATED' 
-                AND COLUMN_NAME = 'TEXT_FOR_LLM'
-                """
-                cursor.execute(check_column_sql)
-                column_exists = cursor.fetchone()[0] > 0
-                
-                if not column_exists:
-                    alter_table_sql = """
-                    ALTER TABLE ANALYTICS_ML.REDDIT_POSTS_ANNOTATED 
-                    ADD COLUMN text_for_llm VARCHAR(16777216)
-                    """
-                    cursor.execute(alter_table_sql)
-                    logger.info("Added text_for_llm column to existing table")
-            except Exception as e:
-                logger.warning(f"Could not check/add text_for_llm column: {e}")
+            # Check and add missing columns for existing tables (migration support)
+            required_columns = {
+                'TEXT_FOR_LLM': 'VARCHAR(16777216)',
+                'MODEL_NAME': 'VARCHAR(100)',
+                'MODEL_VERSION': 'VARCHAR(50)',
+                'PROMPT_HASH': 'VARCHAR(50)'
+            }
             
-            cursor.execute(create_table_sql)
+            try:
+                for column_name, column_type in required_columns.items():
+                    check_column_sql = f"""
+                    SELECT COUNT(*) 
+                    FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_SCHEMA = 'ANALYTICS_ML' 
+                    AND TABLE_NAME = 'REDDIT_POSTS_ANNOTATED' 
+                    AND COLUMN_NAME = '{column_name}'
+                    """
+                    cursor.execute(check_column_sql)
+                    column_exists = cursor.fetchone()[0] > 0
+                    
+                    if not column_exists:
+                        alter_table_sql = f"""
+                        ALTER TABLE ANALYTICS_ML.REDDIT_POSTS_ANNOTATED 
+                        ADD COLUMN {column_name.lower()} {column_type}
+                        """
+                        cursor.execute(alter_table_sql)
+                        logger.info(f"Added {column_name.lower()} column to existing table")
+            except Exception as e:
+                logger.warning(f"Could not check/add required columns: {e}")
+            
             cursor.close()
-            logger.info("Annotation table created or already exists")
+            logger.info("Annotation table created or already exists (idempotency via compound key)")
             
         except Exception as e:
             logger.error(f"Error creating annotation table: {e}")
@@ -278,10 +305,20 @@ class LLMAnnotator:
     
     def save_annotations(self, annotations: List[Dict[str, Any]]):
         """Save annotations to Snowflake using MERGE for idempotency.
-        Updates existing annotations if post_id, model_name, and prompt_hash match."""
+        
+        Implements atomic upsert based on compound key (post_id, model_name, prompt_hash):
+        1. Loads annotations into a temporary staging table
+        2. Executes MERGE INTO to upsert based on compound key
+        3. Cleans up the temporary staging table
+        
+        Updates existing annotations if post_id, model_name, and prompt_hash match.
+        """
         if not annotations:
             logger.warning("No annotations to save")
             return
+        
+        cursor = None
+        temp_table_name = None
         
         try:
             # Convert to DataFrame
@@ -292,29 +329,109 @@ class LLMAnnotator:
             for col in string_columns:
                 if col in df.columns:
                     # Replace problematic characters that could cause SQL issues
-                    df[col] = df[col].astype(str).str.replace('"', "'", regex=False)  # Replace double quotes with single quotes
-                    df[col] = df[col].str.replace('\n', ' ', regex=False)  # Replace newlines with spaces
-                    df[col] = df[col].str.replace('\r', ' ', regex=False)  # Replace carriage returns with spaces
+                    df[col] = df[col].astype(str).str.replace('"', "'", regex=False)
+                    df[col] = df[col].str.replace('\n', ' ', regex=False)
+                    df[col] = df[col].str.replace('\r', ' ', regex=False)
             
             # Convert column names to UPPERCASE for Snowflake
             df.columns = [col.upper() for col in df.columns]
             
-            # Save to Snowflake
+            # Create unique temporary staging table name
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+            temp_table_name = f"TEMP_LLM_ANNOTATIONS_{timestamp}"
+            database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+            temp_table_full = f"{database}.ANALYTICS_ML.{temp_table_name}"
+            
+            logger.info(f"Loading {len(annotations)} annotations into staging table: {temp_table_name}")
+            
+            # Load DataFrame into temporary staging table
             write_pandas(
                 self.snowflake_conn,
                 df,
-                'REDDIT_POSTS_ANNOTATED',
-                auto_create_table=False,
-                overwrite=False,
+                temp_table_name,
+                auto_create_table=True,
+                overwrite=True,
                 use_logical_type=True,
                 schema='ANALYTICS_ML'
             )
             
-            logger.info(f"Saved {len(annotations)} annotations to Snowflake")
+            logger.info(f"Staging table created with {len(annotations)} rows")
+            
+            # Execute MERGE INTO statement with compound key
+            cursor = self.snowflake_conn.cursor()
+            
+            merge_sql = f"""
+            MERGE INTO {database}.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED AS target
+            USING {temp_table_full} AS source
+            ON target.post_id = source.post_id
+                AND target.model_name = source.model_name
+                AND target.prompt_hash = source.prompt_hash
+            WHEN MATCHED THEN
+                UPDATE SET
+                    primary_group = source.primary_group,
+                    primary_topic = source.primary_topic,
+                    secondary_topics = source.secondary_topics,
+                    trimester = source.trimester,
+                    sentiment = source.sentiment,
+                    urgency_0_3 = source.urgency_0_3,
+                    keywords = source.keywords,
+                    safety_flags = source.safety_flags,
+                    post_summary = source.post_summary,
+                    care_response = source.care_response,
+                    text_for_llm = source.text_for_llm,
+                    model_version = source.model_version,
+                    input_tokens = source.input_tokens,
+                    output_tokens = source.output_tokens,
+                    annotated_at = source.annotated_at
+            WHEN NOT MATCHED THEN
+                INSERT (
+                    post_id, primary_group, primary_topic, secondary_topics,
+                    trimester, sentiment, urgency_0_3, keywords, safety_flags,
+                    post_summary, care_response, text_for_llm,
+                    model_name, model_version, prompt_hash,
+                    input_tokens, output_tokens, annotated_at
+                )
+                VALUES (
+                    source.post_id, source.primary_group, source.primary_topic,
+                    source.secondary_topics, source.trimester, source.sentiment,
+                    source.urgency_0_3, source.keywords, source.safety_flags,
+                    source.post_summary, source.care_response, source.text_for_llm,
+                    source.model_name, source.model_version, source.prompt_hash,
+                    source.input_tokens, source.output_tokens, source.annotated_at
+                )
+            """
+            
+            cursor.execute(merge_sql)
+            rows_affected = cursor.rowcount
+            self.snowflake_conn.commit()
+            
+            logger.info(
+                f"MERGE completed: {rows_affected} rows affected "
+                f"({len(annotations)} annotations processed)"
+            )
+            
+            # Clean up temporary staging table
+            drop_sql = f"DROP TABLE IF EXISTS {temp_table_full}"
+            cursor.execute(drop_sql)
+            logger.info(
+                f"Cleaned up temporary staging table: {temp_table_name}"
+            )
             
         except Exception as e:
             logger.error(f"Error saving annotations: {e}")
+            # Attempt cleanup on error
+            if cursor and temp_table_name:
+                try:
+                    database = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+                    temp_table_full = f"{database}.ANALYTICS_ML.{temp_table_name}"
+                    cursor.execute(f"DROP TABLE IF EXISTS {temp_table_full}")
+                    logger.info("Cleaned up temporary staging table after error")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup temp table: {cleanup_error}")
             raise
+        finally:
+            if cursor:
+                cursor.close()
     
     def close(self):
         """Close Snowflake connection."""

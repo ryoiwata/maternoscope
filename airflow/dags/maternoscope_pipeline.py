@@ -11,6 +11,8 @@ LLM Annotation Configuration:
 - Prompts are loaded from external files (prompts/clinical_annotation_*.txt)
 - Configuration managed via config/llm_experiments.yaml
 - Uses LangChain Expression Language for prompt and model management
+- Idempotency: Compound key (post_id, model_name, prompt_hash) ensures
+  no duplicate annotations for same model/prompt version
 
 Excludes: Visualization and Dashboard components
 """
@@ -201,7 +203,11 @@ def annotate_posts_with_llm(**context):
 
     Features:
     - No limit on number of posts (processes all posts needing annotation)
-    - Idempotent (uses MERGE to avoid duplicates)
+    - Robust idempotency based on compound key
+      (post_id, model_name, prompt_hash):
+      * Prevents duplicate API calls for same model/prompt combination
+      * Uses LEFT JOIN filtering to skip already-annotated posts
+      * Atomic upsert via MERGE INTO with temporary staging table
     - Saves cleaned post text (text_for_llm) in output table
     - Uses LangChain LCEL for prompt and model management
     - Loads prompts from external files (configurable via YAML)
