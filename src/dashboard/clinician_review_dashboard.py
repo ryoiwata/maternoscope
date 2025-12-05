@@ -374,181 +374,212 @@ def main():
         with meta_col4:
             st.metric("Sentiment", post['SENTIMENT'] if pd.notna(post['SENTIMENT']) else 'N/A')
         
-        # Single view with all content (no tabs)
+        # Add custom CSS for independent column scrolling
+        st.markdown("""
+        <style>
+        /* Target Streamlit columns for independent scrolling */
+        div[data-testid="column"] {
+            max-height: 85vh;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-right: 10px;
+        }
+        /* Custom scrollbar styling */
+        div[data-testid="column"]::-webkit-scrollbar {
+            width: 8px;
+        }
+        div[data-testid="column"]::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        div[data-testid="column"]::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
+        }
+        div[data-testid="column"]::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+        </style>
+        """, unsafe_allow_html=True)
         
-        # Post Content (PII-Redacted only)
-        st.subheader("📝 Post Content (PII-Redacted - sent to LLM)")
-        st.markdown(f"**Post ID:** `{post['POST_ID']}`")
+        # Two-column layout with independent scrolling
+        left_col, right_col = st.columns([1, 1], gap="large")
         
-        if pd.notna(post['TEXT_FOR_LLM']) and post['TEXT_FOR_LLM']:
-            st.text_area("", post['TEXT_FOR_LLM'], height=200,
-                        disabled=True, key="text_for_llm")
-        else:
-            st.info("No content available")
-        
-        st.markdown("---")
-        
-        # LLM Annotation Summary
-        st.subheader("🤖 LLM Annotation Summary")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            pg = post['PRIMARY_GROUP']
-            st.markdown(f"**Primary Group:** "
-                       f"{pg if pd.notna(pg) else 'N/A'}")
-            pt = post['PRIMARY_TOPIC']
-            st.markdown(f"**Primary Topic:** "
-                       f"{pt if pd.notna(pt) else 'N/A'}")
-            tr = post['TRIMESTER']
-            st.markdown(f"**Trimester:** "
-                       f"{tr if pd.notna(tr) else 'N/A'}")
-        with col2:
-            mn = post['MODEL_NAME']
-            st.markdown(f"**Model:** "
-                       f"{mn if pd.notna(mn) else 'N/A'}")
-            mv = post['MODEL_VERSION']
-            st.markdown(f"**Version:** "
-                       f"{mv if pd.notna(mv) else 'N/A'}")
-            if pd.notna(post['ANNOTATED_AT']):
-                st.markdown(f"**Annotated At:** {post['ANNOTATED_AT']}")
-        
-        if pd.notna(post['POST_SUMMARY']) and post['POST_SUMMARY']:
-            st.markdown("**Post Summary:**")
-            st.info(post['POST_SUMMARY'])
-        
-        if 'KEYWORDS_STR' in post and post['KEYWORDS_STR']:
-            st.markdown("**Keywords:**")
-            st.code(post['KEYWORDS_STR'])
-        
-        if ('SAFETY_FLAGS_STR' in post and
-            post['SAFETY_FLAGS_STR'] and
-            post['SAFETY_FLAGS_STR'] != 'None'):
-            st.markdown("**Safety Flags:**")
-            st.warning(post['SAFETY_FLAGS_STR'])
-        
-        st.markdown("---")
-        
-        # LLM-Generated Care Response
-        st.subheader("💬 LLM-Generated Care Response")
-        if pd.notna(post['CARE_RESPONSE']) and post['CARE_RESPONSE']:
-            st.markdown(post['CARE_RESPONSE'])
-        else:
-            st.warning("No care response available")
-        
-        st.markdown("---")
-        
-        # Rating Section
-        st.subheader("⭐ Rate This LLM Output")
-        
-        # Clinician information
-        clinician_name = st.text_input("Your Name *",
-                                      key="clinician_name")
-        clinician_email = st.text_input("Your Email (optional)",
-                                       key="clinician_email")
-        
-        st.divider()
-        
-        # Ratings
-        st.markdown("### Rating Scale (1 = Poor, 5 = Excellent)")
-        
-        rating_overall = st.slider(
-            "Overall Quality *",
-            min_value=1,
-            max_value=5,
-            value=3,
-            key="rating_overall"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            rating_accuracy = st.slider(
-                "Accuracy (correctness of medical information)",
-                min_value=1, max_value=5, value=3,
-                key="rating_accuracy"
-            )
-
-            rating_empathy = st.slider(
-                "Empathy (tone and emotional support)",
-                min_value=1, max_value=5, value=3,
-                key="rating_empathy"
-            )
-
-        with col2:
-            rating_safety = st.slider(
-                "Safety (appropriate escalation and warnings)",
-                min_value=1, max_value=5, value=3,
-                key="rating_safety"
-            )
-
-            rating_relevance = st.slider(
-                "Relevance (addresses the post's concerns)",
-                min_value=1, max_value=5, value=3,
-                key="rating_relevance"
-            )
-        
-        st.divider()
-        
-        # Comments
-        comments = st.text_area(
-            "Additional Comments (optional)",
-            height=150,
-            placeholder=("Provide specific feedback on what worked "
-                       "well or what could be improved..."),
-            key="comments"
-        )
-        
-        # Submit button
-        if st.button("✅ Submit Rating", type="primary"):
-            if not clinician_name:
-                st.error("Please enter your name")
+        # Left Column: Post Content (PII-Redacted)
+        with left_col:
+            st.subheader("📝 Post Content (PII-Redacted - sent to LLM)")
+            st.markdown(f"**Post ID:** `{post['POST_ID']}`")
+            
+            if pd.notna(post['TEXT_FOR_LLM']) and post['TEXT_FOR_LLM']:
+                st.text_area("", post['TEXT_FOR_LLM'], height=600,
+                            disabled=True, key="text_for_llm")
             else:
-                with st.spinner("Submitting rating..."):
-                    success = submit_rating(
-                        post_id=post['POST_ID'],
-                        clinician_name=clinician_name,
-                        clinician_email=clinician_email,
-                        rating_overall=rating_overall,
-                        rating_accuracy=rating_accuracy,
-                        rating_empathy=rating_empathy,
-                        rating_safety=rating_safety,
-                        rating_relevance=rating_relevance,
-                        comments=comments
-                    )
-                    
-                    if success:
-                        st.success("✅ Rating submitted successfully!")
-                        st.balloons()
-                        
-                        # Track submitted rating
-                        title = post.get('POST_TITLE', 'No Title')
-                        if title and pd.notna(title):
-                            title_display = title[:50]
-                        else:
-                            title_display = 'No Title'
-                        
-                        st.session_state.ratings_submitted.append({
-                            'post_id': post['POST_ID'],
-                            'post_title': title_display,
-                            'timestamp': datetime.now(timezone.utc)
-                        })
-                        
-                        # Clear form
-                        st.session_state.clinician_name = ""
-                        st.session_state.clinician_email = ""
-                    else:
-                        st.error("Failed to submit rating. Please try again.")
+                st.info("No content available")
         
-        # Show submitted ratings for this session
-        if st.session_state.ratings_submitted:
+        # Right Column: LLM Output and Rating
+        with right_col:
+            # LLM Annotation Summary
+            st.subheader("🤖 LLM Annotation Summary")
+            
+            summary_col1, summary_col2 = st.columns(2)
+            with summary_col1:
+                pg = post['PRIMARY_GROUP']
+                st.markdown(f"**Primary Group:** "
+                           f"{pg if pd.notna(pg) else 'N/A'}")
+                pt = post['PRIMARY_TOPIC']
+                st.markdown(f"**Primary Topic:** "
+                           f"{pt if pd.notna(pt) else 'N/A'}")
+                tr = post['TRIMESTER']
+                st.markdown(f"**Trimester:** "
+                           f"{tr if pd.notna(tr) else 'N/A'}")
+            with summary_col2:
+                mn = post['MODEL_NAME']
+                st.markdown(f"**Model:** "
+                           f"{mn if pd.notna(mn) else 'N/A'}")
+                mv = post['MODEL_VERSION']
+                st.markdown(f"**Version:** "
+                           f"{mv if pd.notna(mv) else 'N/A'}")
+                if pd.notna(post['ANNOTATED_AT']):
+                    st.markdown(f"**Annotated At:** {post['ANNOTATED_AT']}")
+            
+            if pd.notna(post['POST_SUMMARY']) and post['POST_SUMMARY']:
+                st.markdown("**Post Summary:**")
+                st.info(post['POST_SUMMARY'])
+            
+            if 'KEYWORDS_STR' in post and post['KEYWORDS_STR']:
+                st.markdown("**Keywords:**")
+                st.code(post['KEYWORDS_STR'])
+            
+            if ('SAFETY_FLAGS_STR' in post and
+                post['SAFETY_FLAGS_STR'] and
+                post['SAFETY_FLAGS_STR'] != 'None'):
+                st.markdown("**Safety Flags:**")
+                st.warning(post['SAFETY_FLAGS_STR'])
+            
+            st.markdown("---")
+            
+            # LLM-Generated Care Response
+            st.subheader("💬 LLM-Generated Care Response")
+            if pd.notna(post['CARE_RESPONSE']) and post['CARE_RESPONSE']:
+                st.text_area("", post['CARE_RESPONSE'], height=250,
+                            disabled=True, key="care_response")
+            else:
+                st.warning("No care response available")
+            
+            st.markdown("---")
+            
+            # Rating Section
+            st.subheader("⭐ Rate This LLM Output")
+            
+            # Clinician information
+            clinician_name = st.text_input("Your Name *",
+                                          key="clinician_name")
+            clinician_email = st.text_input("Your Email (optional)",
+                                           key="clinician_email")
+            
             st.divider()
-            st.markdown("### Ratings Submitted This Session")
-            submitted_df = pd.DataFrame(
-                st.session_state.ratings_submitted
+            
+            # Ratings
+            st.markdown("### Rating Scale (1 = Poor, 5 = Excellent)")
+            
+            rating_overall = st.slider(
+                "Overall Quality *",
+                min_value=1,
+                max_value=5,
+                value=3,
+                key="rating_overall"
             )
-            st.dataframe(
-                submitted_df[['post_id', 'post_title', 'timestamp']],
-                use_container_width=True
+            
+            rating_col1, rating_col2 = st.columns(2)
+            with rating_col1:
+                rating_accuracy = st.slider(
+                    "Accuracy (correctness of medical information)",
+                    min_value=1, max_value=5, value=3,
+                    key="rating_accuracy"
+                )
+
+                rating_empathy = st.slider(
+                    "Empathy (tone and emotional support)",
+                    min_value=1, max_value=5, value=3,
+                    key="rating_empathy"
+                )
+
+            with rating_col2:
+                rating_safety = st.slider(
+                    "Safety (appropriate escalation and warnings)",
+                    min_value=1, max_value=5, value=3,
+                    key="rating_safety"
+                )
+
+                rating_relevance = st.slider(
+                    "Relevance (addresses the post's concerns)",
+                    min_value=1, max_value=5, value=3,
+                    key="rating_relevance"
+                )
+            
+            st.divider()
+            
+            # Comments
+            comments = st.text_area(
+                "Additional Comments (optional)",
+                height=150,
+                placeholder=("Provide specific feedback on what worked "
+                           "well or what could be improved..."),
+                key="comments"
             )
+            
+            # Submit button
+            if st.button("✅ Submit Rating", type="primary", use_container_width=True):
+                if not clinician_name:
+                    st.error("Please enter your name")
+                else:
+                    with st.spinner("Submitting rating..."):
+                        success = submit_rating(
+                            post_id=post['POST_ID'],
+                            clinician_name=clinician_name,
+                            clinician_email=clinician_email,
+                            rating_overall=rating_overall,
+                            rating_accuracy=rating_accuracy,
+                            rating_empathy=rating_empathy,
+                            rating_safety=rating_safety,
+                            rating_relevance=rating_relevance,
+                            comments=comments
+                        )
+                        
+                        if success:
+                            st.success("✅ Rating submitted successfully!")
+                            st.balloons()
+                            
+                            # Track submitted rating
+                            title = post.get('POST_TITLE', 'No Title')
+                            if title and pd.notna(title):
+                                title_display = title[:50]
+                            else:
+                                title_display = 'No Title'
+                            
+                            st.session_state.ratings_submitted.append({
+                                'post_id': post['POST_ID'],
+                                'post_title': title_display,
+                                'timestamp': datetime.now(timezone.utc)
+                            })
+                            
+                            # Clear form
+                            st.session_state.clinician_name = ""
+                            st.session_state.clinician_email = ""
+                        else:
+                            st.error("Failed to submit rating. Please try again.")
+            
+            # Show submitted ratings for this session
+            if st.session_state.ratings_submitted:
+                st.divider()
+                st.markdown("### Ratings Submitted This Session")
+                submitted_df = pd.DataFrame(
+                    st.session_state.ratings_submitted
+                )
+                st.dataframe(
+                    submitted_df[['post_id', 'post_title', 'timestamp']],
+                    use_container_width=True
+                )
 
 
 if __name__ == "__main__":
