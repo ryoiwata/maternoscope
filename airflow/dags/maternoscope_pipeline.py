@@ -4,8 +4,13 @@ MaternoScope Data Pipeline DAG
 This DAG orchestrates the complete data pipeline:
 1. Reddit Data Ingestion (Bronze Layer)
 2. dbt Staging Transformations (Silver Layer)
-3. LLM Annotation (ML Layer)
+3. LLM Annotation (ML Layer) - Uses LangChain LCEL with external prompts
 4. dbt Marts Transformations (Gold Layer)
+
+LLM Annotation Configuration:
+- Prompts are loaded from external files (prompts/clinical_annotation_*.txt)
+- Configuration managed via config/llm_experiments.yaml
+- Uses LangChain Expression Language for prompt and model management
 
 Excludes: Visualization and Dashboard components
 """
@@ -198,6 +203,9 @@ def annotate_posts_with_llm(**context):
     - No limit on number of posts (processes all posts needing annotation)
     - Idempotent (uses MERGE to avoid duplicates)
     - Saves cleaned post text (text_for_llm) in output table
+    - Uses LangChain LCEL for prompt and model management
+    - Loads prompts from external files (configurable via YAML)
+    - Configuration managed via config/llm_experiments.yaml
     """
     import subprocess
     from dotenv import load_dotenv
@@ -222,6 +230,7 @@ def annotate_posts_with_llm(**context):
     ]
 
     print("Running LLM annotation (no limit - processing all posts)")
+    print("Using LangChain LCEL with external prompt files")
     print(f"Command: {' '.join(cmd)}")
 
     result = subprocess.run(

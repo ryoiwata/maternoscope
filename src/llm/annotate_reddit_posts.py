@@ -19,10 +19,12 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
-from openai import OpenAI
 import pandas as pd
 from typing import Dict, Any, List
 import hashlib
+import yaml
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 
 # Load environment variables
 load_dotenv()
@@ -34,151 +36,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Prompt template
-PROMPT_TEMPLATE = """Task: Given a cleaned Reddit post about pregnancy or maternal care, produce ONE JSON object that includes:
-1) Topic categorization per the taxonomy below,
-2) A concise factual summary of the post ("post_summary"),
-3) A clinician-style, empathetic Reddit reply ("care_response"),
-4) A list of meaningful care-related keywords ("keywords"),
-5) A list of safety or escalation flags ("safety_flags").
-
----
-
-KEYWORDS  
-Extract 5–20 meaningful tokens that reflect clinical, behavioral, contextual, or social relevance — not filler or emotional words.  
-You may include words from the lists below **plus any other terms the model deems informative for identifying trends or dimensions in pregnancy and maternal care.**  
-This includes emerging medications, health technologies, new policies, social issues, or slang commonly used in patient discussions.
-
-Domains (examples only, not exhaustive):
-1️⃣ Clinical & symptom-related → "bleeding", "cramping", "pain", "spotting", "swelling", "contractions", "nausea", "headache", "preeclampsia", "ultrasound", "hcg", "glucose test", "infection".  
-2️⃣ Medications & labs → "iron", "tylenol", "prenatal vitamin", "magnesium", "zofran", "insulin", "antibiotic", "lab results".  
-3️⃣ Mental health → "anxiety", "depression", "panic", "therapy", "postpartum depression", "lonely", "stressed".  
-4️⃣ Access & insurance → "medicaid", "insurance", "copay", "appointment", "ob-gyn", "midwife", "telehealth", "clinic".  
-5️⃣ Parenting & postpartum → "breastfeeding", "bottle feeding", "sleep", "c-section", "NICU", "pumping", "maternity leave".  
-6️⃣ Policy, geographic & social context → "texas", "rural", "law", "policy", "coverage", "equity", "leave policy".  
-7️⃣ Other emerging, data-relevant, or trend-signaling terms → anything about technology, social barriers, medication shortages, new slang, or community hashtags.
-
-Exclude stopwords, pronouns, and generic filler (e.g., "help," "please," "feel"). Include lowercase, short tokens only.
-
----
-
-SAFETY FLAGS  
-List all that apply. Use the categories below, adding specific triggers or urgent-care keywords if mentioned.
-
-- "urgent_bleeding" → heavy bleeding, soaking pads, hemorrhage, etc.  
-- "urgent_pain" → severe abdominal, pelvic, or back pain; contractions or cramps suggesting preterm labor.  
-- "urgent_fever_infection" → fever, chills, discharge, infection, wound issues.  
-- "urgent_dizziness_fainting" → fainting, dizziness, low blood pressure, weakness.  
-- "urgent_breathing_chest" → shortness of breath, chest pain, heart racing.  
-- "urgent_fetal_concern" → no or reduced fetal movement, kick count worries.  
-- "urgent_postpartum" → heavy bleeding, severe pain, or fever after delivery.  
-- "mental_health_crisis" → suicidal ideation, panic, hopelessness, severe anxiety.  
-- "miscarriage_or_loss" → miscarriage, pregnancy loss, stillbirth.  
-- "medication_safety" → unsafe drug use, dosing confusion, substance exposure.  
-- "infection_or_sepsis" → uterine infection, endometritis, wound infection.  
-- "other_concern" → other safety-relevant escalation (e.g., swelling, blurred vision, hypertension).
-
-If no urgent or risky content, return an empty array.
-
----
-
-TAXONOMY
-groups:
-- clinical
-  topics: symptoms_body_changes, medications_supplements, test_results_labs, pregnancy_complications, labor_delivery
-- mental_health
-  topics: anxiety_fear_uncertainty, mood_depression, body_image_identity, relationship_stress, peer_support_requests
-- lifestyle_parenting
-  topics: nutrition_diet, exercise_movement, sleep_fatigue, work_leave_career, postpartum_care
-- access_navigation
-  topics: choosing_provider, hospital_clinic_experiences, insurance_costs, telehealth_virtual_care, system_barriers_equity
-- community_info
-  topics: ask_experiences_advice, share_stories_outcomes, product_device_discussions, information_validation_misinformation
-- meta_context
-  topics: question_seeking_info, experience_sharing_narrative, opinion_rant_vent, announcement_milestone, policy_advocacy_news
-
----
-
-TRIMESTER ENUM LOGIC  
-- "preconception" → trying to conceive or planning pregnancy  
-- "first", "second", "third" → stated or clearly implied  
-- "pregnant" → clearly pregnant but trimester not specified  
-- "postpartum" → after giving birth  
-- "miscarriage" → discussing pregnancy loss  
-- "unclear" → insufficient info to determine pregnancy status  
-
----
-
-ENUMS
-- primary_group ∈ {{clinical, mental_health, lifestyle_parenting, access_navigation, community_info, meta_context}}
-- primary_topic ∈ one of the topics listed under its group
-- trimester ∈ {{preconception, first, second, third, pregnant, postpartum, miscarriage, unclear}}
-- sentiment ∈ {{negative, neutral, positive}}
-- urgency_0_3 ∈ {{0,1,2,3}} (0=routine, 3=urgent)
-
----
-
-RULES
-- Choose exactly 1 primary_group and 1 primary_topic.
-- Optionally add up to 3 secondary_topics.
-- Use "unknown" or "unclear" when needed.
-- Do NOT include the original post text in the JSON.
-- `post_summary` must be a neutral, factual summary (1–3 sentences).
-- `care_response` must be an empathetic, safe Reddit-style clinician reply consistent with Pomelo's tone.
-
----
-
-JSON SCHEMA
-{{
-  "post_id": string,
-  "primary_group": string,
-  "primary_topic": string,
-  "secondary_topics": string[],          // 0–3 items
-  "trimester": string,
-  "sentiment": string,
-  "urgency_0_3": integer,
-  "keywords": string[],                  // 5–20 informative, trend-aware, domain-relevant tokens
-  "safety_flags": string[],              // urgent-care or risk indicators
-  "post_summary": string,                // factual summary of the Reddit post
-  "care_response": string,               // empathetic clinician-style Reddit reply (120–220 words)
-  "model_name": string,
-  "model_version": string,
-  "prompt_hash": string,
-  "input_tokens": integer,
-  "output_tokens": integer,
-  "annotated_at": string                 // ISO8601
-}}
-
-Return JSON ONLY. No explanations or markdown.
-
-Now annotate and reply to this post:
-
-post_id: "{{POST_ID}}"
-post_text: "{{POST_TEXT}}"
-
-"""
-
-
-def get_prompt_hash() -> str:
-    """Generate a hash of the prompt template for tracking."""
-    return hashlib.sha256(PROMPT_TEMPLATE.encode()).hexdigest()[:16]
 
 
 class LLMAnnotator:
-    def __init__(self):
-        """Initialize OpenAI and Snowflake connections."""
-        # OpenAI client
-        self.openai_client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            organization=os.getenv("OPENAI_ORG_ID", None)
+    def __init__(self, experiment_name: str = "default_run"):
+        """Initialize OpenAI and Snowflake connections.
+        
+        Args:
+            experiment_name: Name of the experiment configuration to load from YAML
+        """
+        # Load configuration
+        self.config = self.load_config(experiment_name)
+        self.model_name = self.config['model_name']
+        self.model_version = self.config['version']
+        
+        # Load prompts from external files
+        project_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
-        self.model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        self.model_version = "1.0.0"
-        self.prompt_hash = get_prompt_hash()
+        self.system_text = self._load_prompt_file(
+            os.path.join(project_root, self.config['system_prompt_file'])
+        )
+        self.user_template = self._load_prompt_file(
+            os.path.join(project_root, self.config['user_prompt_file'])
+        )
+        
+        # Calculate prompt hash from concatenated system and user prompts
+        combined_prompts = self.system_text + "\n\n" + self.user_template
+        self.prompt_hash = hashlib.sha256(combined_prompts.encode()).hexdigest()[:16]
+        
+        # Initialize LangChain components
+        self.llm = ChatOpenAI(
+            model=self.model_name,
+            api_key=os.getenv("OPENAI_API_KEY"),
+            organization=os.getenv("OPENAI_ORG_ID", None),
+            temperature=0,
+            model_kwargs={"response_format": {"type": "json_object"}}
+        )
+        
+        # Create prompt template with system and user messages
+        self.prompt_template = ChatPromptTemplate.from_messages([
+            ("system", self.system_text),
+            ("user", self.user_template)
+        ])
         
         # Snowflake connection
         self.snowflake_conn = None
         self.connect_snowflake()
+    
+    def load_config(self, experiment_name: str) -> Dict[str, Any]:
+        """Load experiment configuration from YAML file."""
+        project_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        config_path = os.path.join(project_root, 'config', 'llm_experiments.yaml')
+        
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"Configuration file not found: {config_path}"
+            )
+        
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+        
+        if experiment_name not in config_data:
+            raise KeyError(
+                f"Experiment '{experiment_name}' not found in config file. "
+                f"Available experiments: {list(config_data.keys())}"
+            )
+        
+        return config_data[experiment_name]
+    
+    def _load_prompt_file(self, file_path: str) -> str:
+        """Load prompt content from a text file."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Prompt file not found: {file_path}")
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read().strip()
         
     def connect_snowflake(self):
         """Connect to Snowflake."""
@@ -233,52 +168,42 @@ class LLMAnnotator:
             raise
     
     def annotate_post(self, post_id: str, post_text: str) -> Dict[str, Any]:
-        """Call OpenAI API to annotate a post."""
+        """Call OpenAI API to annotate a post using LangChain LCEL."""
         try:
-            # Prepare prompt
-            prompt = PROMPT_TEMPLATE.replace("{{POST_ID}}", post_id).replace("{{POST_TEXT}}", post_text[:2000])  # Limit text length
+            # Limit text length
+            post_text_limited = post_text[:2000]
             
-            # Call OpenAI API
-            system_message = """You are both a precise clinical text annotator and a Pomelo Care clinician communicator.
-Return ONLY valid JSON (no prose, no markdown). If unsure, use "unknown" or [] as specified.
-
-Your tasks:
-(a) Categorize the post using the taxonomy.
-(b) Summarize it objectively.
-(c) Generate a safe, empathetic clinician-style Reddit reply in Pomelo Care's tone.
-(d) Extract care-relevant keywords and safety flags for downstream analysis.
-
-Tone & persona:
-- Write in the calm, supportive, and informed tone of a licensed maternal-care clinician.
-- Do NOT introduce yourself or mention any organization.
-- Warm, inclusive, reassuring, 6th–8th grade reading level.
-- Provide general, educational guidance; do NOT diagnose or prescribe.
-- Encourage follow-up with their OB-GYN, midwife, or nurse for individualized care.
-- If serious symptoms appear (e.g., heavy bleeding, severe pain, headache with vision changes, fever ≥100.4°F, shortness of breath, chest pain, suicidal thoughts), instruct immediate evaluation at an ER, Labor & Delivery, or local emergency services.
-- If a mental health crisis is implied, recommend emergency or crisis line support."""
-            
-            response = self.openai_client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"}
+            # Get formatted messages from prompt template
+            formatted_messages = self.prompt_template.format_messages(
+                post_id=post_id,
+                post_text=post_text_limited
             )
             
-            # Parse response
-            content = response.choices[0].message.content
+            # Invoke LLM to get response with metadata
+            llm_response = self.llm.invoke(formatted_messages)
+            
+            # Extract token usage from response metadata
+            input_tokens = 0
+            output_tokens = 0
+            if hasattr(llm_response, 'response_metadata'):
+                usage = llm_response.response_metadata.get('token_usage', {})
+                input_tokens = usage.get('prompt_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0)
+            
+            # Parse JSON from LLM response content
+            content = llm_response.content
             annotation = json.loads(content)
             
             # Add metadata
+            annotation['post_id'] = post_id  # Ensure post_id is included
             annotation['model_name'] = self.model_name
             annotation['model_version'] = self.model_version
             annotation['prompt_hash'] = self.prompt_hash
-            annotation['input_tokens'] = response.usage.prompt_tokens
-            annotation['output_tokens'] = response.usage.completion_tokens
+            annotation['input_tokens'] = input_tokens
+            annotation['output_tokens'] = output_tokens
             annotation['annotated_at'] = datetime.now(timezone.utc).isoformat()
             
-            logger.info(f"Annotated post {post_id} (tokens: {annotation['input_tokens']} + {annotation['output_tokens']})")
+            logger.info(f"Annotated post {post_id} (tokens: {input_tokens} + {output_tokens})")
             return annotation
             
         except Exception as e:
