@@ -134,11 +134,19 @@ def fetch_posts(limit: int = 100,
                 primary_topic: Optional[str] = None,
                 urgency_min: Optional[int] = None,
                 prompt_hash: Optional[str] = None,
-                reviewed_filter: Optional[str] = None):
+                reviewed_filter: Optional[str] = None,
+                post_date_from: Optional[str] = None,
+                post_date_to: Optional[str] = None,
+                annotated_date_from: Optional[str] = None,
+                annotated_date_to: Optional[str] = None):
     """Fetch posts from Snowflake for review.
     
     Args:
         reviewed_filter: "all", "reviewed", or "not_reviewed"
+        post_date_from: Start date for post date filter (YYYY-MM-DD)
+        post_date_to: End date for post date filter (YYYY-MM-DD)
+        annotated_date_from: Start date for annotation date filter (YYYY-MM-DD)
+        annotated_date_to: End date for annotation date filter (YYYY-MM-DD)
     """
     conn = connect_snowflake()
     if conn is None:
@@ -197,6 +205,24 @@ def fetch_posts(limit: int = 100,
             conditions.append("r.RATING_ID IS NOT NULL")
         elif reviewed_filter == "not_reviewed":
             conditions.append("r.RATING_ID IS NULL")
+        if post_date_from:
+            conditions.append(
+                f"COALESCE(s.POST_DATE, a.ANNOTATED_AT::DATE) "
+                f">= '{post_date_from}'"
+            )
+        if post_date_to:
+            conditions.append(
+                f"COALESCE(s.POST_DATE, a.ANNOTATED_AT::DATE) "
+                f"<= '{post_date_to}'"
+            )
+        if annotated_date_from:
+            conditions.append(
+                f"a.ANNOTATED_AT::DATE >= '{annotated_date_from}'"
+            )
+        if annotated_date_to:
+            conditions.append(
+                f"a.ANNOTATED_AT::DATE <= '{annotated_date_to}'"
+            )
         
         if conditions:
             query += " AND " + " AND ".join(conditions)
@@ -457,15 +483,70 @@ def main():
             index=0
         )
         
+        st.divider()
+        st.markdown("### Date Filters")
+        
+        # Post date filters
+        post_date_col1, post_date_col2 = st.columns(2)
+        with post_date_col1:
+            post_date_from = st.date_input(
+                "Post Date From",
+                value=None,
+                key="post_date_from"
+            )
+        with post_date_col2:
+            post_date_to = st.date_input(
+                "Post Date To",
+                value=None,
+                key="post_date_to"
+            )
+        
+        # Annotation date filters
+        annotated_date_col1, annotated_date_col2 = st.columns(2)
+        with annotated_date_col1:
+            annotated_date_from = st.date_input(
+                "Annotation Date From",
+                value=None,
+                key="annotated_date_from"
+            )
+        with annotated_date_col2:
+            annotated_date_to = st.date_input(
+                "Annotation Date To",
+                value=None,
+                key="annotated_date_to"
+            )
+        
         if st.button("🔄 Load Posts", type="primary"):
             with st.spinner("Loading posts from Snowflake..."):
+                # Convert date objects to strings if they exist
+                post_date_from_str = (
+                    post_date_from.strftime('%Y-%m-%d')
+                    if post_date_from else None
+                )
+                post_date_to_str = (
+                    post_date_to.strftime('%Y-%m-%d')
+                    if post_date_to else None
+                )
+                annotated_date_from_str = (
+                    annotated_date_from.strftime('%Y-%m-%d')
+                    if annotated_date_from else None
+                )
+                annotated_date_to_str = (
+                    annotated_date_to.strftime('%Y-%m-%d')
+                    if annotated_date_to else None
+                )
+                
                 df = fetch_posts(
                     limit=limit,
                     subreddit=subreddit_filter if subreddit_filter else None,
                     primary_topic=primary_topic_filter,
                     urgency_min=urgency_filter,
                     prompt_hash=prompt_hash_filter if prompt_hash_filter else None,
-                    reviewed_filter=reviewed_filter
+                    reviewed_filter=reviewed_filter,
+                    post_date_from=post_date_from_str,
+                    post_date_to=post_date_to_str,
+                    annotated_date_from=annotated_date_from_str,
+                    annotated_date_to=annotated_date_to_str
                 )
                 if df is not None and len(df) > 0:
                     st.session_state.posts_df = df
@@ -624,6 +705,19 @@ def main():
                 st.markdown("**Post Summary:**")
                 st.info(post['POST_SUMMARY'])
             
+            st.markdown("---")
+            
+            # Show submitted ratings for this session
+            if st.session_state.ratings_submitted:
+                st.markdown("### Ratings Submitted This Session")
+                submitted_df = pd.DataFrame(
+                    st.session_state.ratings_submitted
+                )
+                st.dataframe(
+                    submitted_df[['post_id', 'post_title', 'timestamp']],
+                    use_container_width=True
+                )
+            
             st.markdown('</div>', unsafe_allow_html=True)
         
         # Right Column: LLM Output and Rating
@@ -761,18 +855,6 @@ def main():
                             st.rerun()
                         else:
                             st.error("Failed to submit rating. Please try again.")
-            
-            # Show submitted ratings for this session
-            if st.session_state.ratings_submitted:
-                st.divider()
-                st.markdown("### Ratings Submitted This Session")
-                submitted_df = pd.DataFrame(
-                    st.session_state.ratings_submitted
-                )
-                st.dataframe(
-                    submitted_df[['post_id', 'post_title', 'timestamp']],
-                    use_container_width=True
-                )
             
             # Close scrollable container for right column
             st.markdown('</div>', unsafe_allow_html=True)
