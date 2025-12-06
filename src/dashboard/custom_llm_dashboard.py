@@ -368,6 +368,11 @@ def ensure_interactions_table_exists(session: Session) -> bool:
             llm_output VARCHAR(16777216),
             review_feedback VARCHAR(5000),
             review_rating INTEGER,
+            rating_overall INTEGER,
+            rating_accuracy INTEGER,
+            rating_empathy INTEGER,
+            rating_safety INTEGER,
+            rating_relevance INTEGER,
             llm_model_name VARCHAR(100),
             llm_input_tokens INTEGER,
             llm_output_tokens INTEGER,
@@ -391,6 +396,11 @@ def ensure_interactions_table_exists(session: Session) -> bool:
                 ('LLM_MODEL_NAME', 'llm_model_name', 'VARCHAR(100)'),
                 ('LLM_INPUT_TOKENS', 'llm_input_tokens', 'INTEGER'),
                 ('LLM_OUTPUT_TOKENS', 'llm_output_tokens', 'INTEGER'),
+                ('RATING_OVERALL', 'rating_overall', 'INTEGER'),
+                ('RATING_ACCURACY', 'rating_accuracy', 'INTEGER'),
+                ('RATING_EMPATHY', 'rating_empathy', 'INTEGER'),
+                ('RATING_SAFETY', 'rating_safety', 'INTEGER'),
+                ('RATING_RELEVANCE', 'rating_relevance', 'INTEGER'),
             ]
             
             for upper_col_name, lower_col_name, col_type in columns_to_check:
@@ -524,7 +534,11 @@ def update_interaction_review(
     session: Session,
     interaction_id: str,
     review_feedback: str,
-    review_rating: Optional[int] = None,
+    rating_overall: int,
+    rating_accuracy: Optional[int] = None,
+    rating_empathy: Optional[int] = None,
+    rating_safety: Optional[int] = None,
+    rating_relevance: Optional[int] = None,
     reviewer_name: Optional[str] = None
 ) -> bool:
     """
@@ -540,11 +554,23 @@ def update_interaction_review(
             return f"'{text.replace("'", "''")}'"
         
         review_feedback_escaped = escape_sql(review_feedback)
-        review_rating_val = (
-            review_rating if review_rating is not None else "NULL"
-        )
         reviewer_name_escaped = (
             escape_sql(reviewer_name) if reviewer_name else "NULL"
+        )
+        
+        # Format rating values
+        rating_overall_val = str(rating_overall)
+        rating_accuracy_val = (
+            str(rating_accuracy) if rating_accuracy is not None else "NULL"
+        )
+        rating_empathy_val = (
+            str(rating_empathy) if rating_empathy is not None else "NULL"
+        )
+        rating_safety_val = (
+            str(rating_safety) if rating_safety is not None else "NULL"
+        )
+        rating_relevance_val = (
+            str(rating_relevance) if rating_relevance is not None else "NULL"
         )
 
         table_name = (
@@ -554,7 +580,11 @@ def update_interaction_review(
         UPDATE {table_name}
         SET 
             review_feedback = {review_feedback_escaped},
-            review_rating = {review_rating_val},
+            rating_overall = {rating_overall_val},
+            rating_accuracy = {rating_accuracy_val},
+            rating_empathy = {rating_empathy_val},
+            rating_safety = {rating_safety_val},
+            rating_relevance = {rating_relevance_val},
             reviewer_name = {reviewer_name_escaped},
             reviewed_at = CURRENT_TIMESTAMP()
         WHERE interaction_id = '{interaction_id.replace("'", "''")}'
@@ -788,51 +818,78 @@ def display_parsed_json_response(
         
         st.divider()
         
-        # Rating
-        review_rating = st.slider(
-            "Rating (1-5):",
+        # Ratings
+        st.markdown("### Rating Scale (1 = Poor, 5 = Excellent)")
+        
+        rating_overall = st.slider(
+            "Overall Quality *",
             min_value=1,
             max_value=5,
             value=3,
-            help=(
-                "1 = Poor, 2 = Below Average, 3 = Average, "
-                "4 = Good, 5 = Excellent"
-            ),
-            key="review_rating"
+            key="rating_overall_json"
         )
+        
+        rating_col1, rating_col2 = st.columns(2)
+        with rating_col1:
+            rating_accuracy = st.slider(
+                "Accuracy (correctness of medical information)",
+                min_value=1, max_value=5, value=3,
+                key="rating_accuracy_json"
+            )
+
+            rating_empathy = st.slider(
+                "Empathy (tone and emotional support)",
+                min_value=1, max_value=5, value=3,
+                key="rating_empathy_json"
+            )
+
+        with rating_col2:
+            rating_safety = st.slider(
+                "Safety (appropriate escalation and warnings)",
+                min_value=1, max_value=5, value=3,
+                key="rating_safety_json"
+            )
+
+            rating_relevance = st.slider(
+                "Relevance (addresses the post's concerns)",
+                min_value=1, max_value=5, value=3,
+                key="rating_relevance_json"
+            )
+        
+        st.divider()
         
         # Review feedback
         review_feedback = st.text_area(
-            "Review Feedback:",
+            "Additional Comments (optional)",
             height=150,
-            placeholder="Provide your feedback on the LLM response...",
-            help=(
-                "Share your thoughts on the quality, accuracy, "
-                "usefulness, etc."
+            placeholder=(
+                "Provide specific feedback on what worked "
+                "well or what could be improved..."
             ),
-            key="review_feedback"
+            key="review_feedback_json"
         )
         
         # Submit review button
         if st.button("💾 Save Review", type="primary", use_container_width=True, key="save_review_json"):
-            if not review_feedback.strip():
-                st.error("Please provide some review feedback.")
-            else:
-                with st.spinner("Saving review..."):
-                    success = update_interaction_review(
-                        session,
-                        interaction_id,
-                        review_feedback,
-                        review_rating,
-                        reviewer_name if reviewer_name.strip() else None
-                    )
-                    
-                    if success:
-                        st.success("✅ Review saved successfully!")
-                        st.balloons()
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to save review. Please try again.")
+            with st.spinner("Saving review..."):
+                success = update_interaction_review(
+                    session,
+                    interaction_id,
+                    review_feedback if review_feedback.strip() else "",
+                    rating_overall,
+                    rating_accuracy,
+                    rating_empathy,
+                    rating_safety,
+                    rating_relevance,
+                    reviewer_name if reviewer_name.strip() else None
+                )
+                
+                if success:
+                    st.success("✅ Review saved successfully!")
+                    st.balloons()
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to save review. Please try again.")
         
         st.markdown("---")
         
@@ -1276,44 +1333,78 @@ def main():
                         key="reviewer_name_raw"
                     )
                     
-                    review_rating = st.slider(
-                        "Rating (1-5):",
+                    st.divider()
+                    
+                    # Ratings
+                    st.markdown("### Rating Scale (1 = Poor, 5 = Excellent)")
+                    
+                    rating_overall = st.slider(
+                        "Overall Quality *",
                         min_value=1,
                         max_value=5,
                         value=3,
-                        help=(
-                            "1 = Poor, 2 = Below Average, 3 = Average, "
-                            "4 = Good, 5 = Excellent"
-                        ),
-                        key="review_rating_raw"
+                        key="rating_overall_raw"
                     )
                     
+                    rating_col1, rating_col2 = st.columns(2)
+                    with rating_col1:
+                        rating_accuracy = st.slider(
+                            "Accuracy (correctness of medical information)",
+                            min_value=1, max_value=5, value=3,
+                            key="rating_accuracy_raw"
+                        )
+
+                        rating_empathy = st.slider(
+                            "Empathy (tone and emotional support)",
+                            min_value=1, max_value=5, value=3,
+                            key="rating_empathy_raw"
+                        )
+
+                    with rating_col2:
+                        rating_safety = st.slider(
+                            "Safety (appropriate escalation and warnings)",
+                            min_value=1, max_value=5, value=3,
+                            key="rating_safety_raw"
+                        )
+
+                        rating_relevance = st.slider(
+                            "Relevance (addresses the post's concerns)",
+                            min_value=1, max_value=5, value=3,
+                            key="rating_relevance_raw"
+                        )
+                    
+                    st.divider()
+                    
                     review_feedback = st.text_area(
-                        "Review Feedback:",
+                        "Additional Comments (optional)",
                         height=150,
-                        placeholder="Provide your feedback...",
+                        placeholder=(
+                            "Provide specific feedback on what worked "
+                            "well or what could be improved..."
+                        ),
                         key="review_feedback_raw"
                     )
                     
                     if st.button("💾 Save Review", type="primary", use_container_width=True, key="save_review_raw"):
-                        if not review_feedback.strip():
-                            st.error("Please provide some review feedback.")
-                        else:
-                            with st.spinner("Saving review..."):
-                                success = update_interaction_review(
-                                    session,
-                                    st.session_state.interaction_id,
-                                    review_feedback,
-                                    review_rating,
-                                    reviewer_name if reviewer_name.strip() else None
-                                )
-                                
-                                if success:
-                                    st.success("✅ Review saved successfully!")
-                                    st.balloons()
-                                    st.rerun()
-                                else:
-                                    st.error("❌ Failed to save review.")
+                        with st.spinner("Saving review..."):
+                            success = update_interaction_review(
+                                session,
+                                st.session_state.interaction_id,
+                                review_feedback if review_feedback.strip() else "",
+                                rating_overall,
+                                rating_accuracy,
+                                rating_empathy,
+                                rating_safety,
+                                rating_relevance,
+                                reviewer_name if reviewer_name.strip() else None
+                            )
+                            
+                            if success:
+                                st.success("✅ Review saved successfully!")
+                                st.balloons()
+                                st.rerun()
+                            else:
+                                st.error("❌ Failed to save review.")
                     
                     st.markdown('</div>', unsafe_allow_html=True)
                 
