@@ -22,6 +22,7 @@ import os
 import uuid
 import hashlib
 import re
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -248,7 +249,8 @@ def call_llm(
     user_input: str,
     system_prompt: str,
     user_prompt_template: str,
-    prompt_hash: str
+    prompt_hash: str,
+    request_json: bool = False
 ) -> Dict[str, Any]:
     """
     Call LLM with system and user prompts.
@@ -259,13 +261,44 @@ def call_llm(
         user_prompt_template: User prompt template (may contain {user_input},
                               {post_text}, {post_id}, etc.)
         prompt_hash: Hash of the combined prompts
+        request_json: If True, request JSON format response
     
     Returns:
         Dictionary with 'response', 'input_tokens', 'output_tokens',
         'model_name', 'prompt_hash'
     """
     try:
-        llm = get_llm_client()
+        # Check if we should request JSON format
+        # (if system prompt mentions JSON or if explicitly requested)
+        should_request_json = (
+            request_json or
+            "json" in system_prompt.lower() or
+            "json" in user_prompt_template.lower()
+        )
+        
+        # Get or create LLM client with JSON format if needed
+        if should_request_json:
+            # Create a new client with JSON format for this call
+            api_key = os.getenv("OPENAI_API_KEY")
+            model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            temp_str = os.getenv("OPENAI_TEMPERATURE", None)
+            temperature = float(temp_str) if temp_str else None
+            
+            llm_kwargs = {
+                "model": model_name,
+                "api_key": api_key,
+                "model_kwargs": {"response_format": {"type": "json_object"}}
+            }
+            
+            if os.getenv("OPENAI_ORG_ID"):
+                llm_kwargs["organization"] = os.getenv("OPENAI_ORG_ID")
+            
+            if temperature is not None:
+                llm_kwargs["temperature"] = temperature
+            
+            llm = ChatOpenAI(**llm_kwargs)
+        else:
+            llm = get_llm_client()
         
         # Replace common placeholders with {user_input} for formatting
         # This allows prompts with {post_text} or {post_id} to work
@@ -536,6 +569,295 @@ def update_interaction_review(
 
 
 # ============================================================================
+# JSON PARSING AND DISPLAY FUNCTIONS
+# ============================================================================
+
+
+def parse_llm_response(response_text: str) -> Dict[str, Any]:
+    """
+    Parse LLM response text, attempting to extract JSON.
+    Returns dict with parsed data or raw response if not JSON.
+    """
+    if not response_text:
+        return {"raw_response": "", "is_json": False}
+    
+    # Try to parse as JSON
+    try:
+        # Remove markdown code blocks if present
+        cleaned = response_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        
+        cleaned = cleaned.strip()
+        
+        # Try to parse JSON
+        parsed = json.loads(cleaned)
+        return {
+            "raw_response": response_text,
+            "is_json": True,
+            "parsed": parsed
+        }
+    except (json.JSONDecodeError, ValueError):
+        # Not JSON, return as raw text
+        return {
+            "raw_response": response_text,
+            "is_json": False
+        }
+
+
+def format_array_display(arr) -> str:
+    """Format array for display."""
+    if not arr:
+        return "None"
+    if isinstance(arr, list):
+        return ", ".join(str(item) for item in arr)
+    return str(arr)
+
+
+def display_parsed_json_response(
+    parsed_data: Dict[str, Any],
+    user_input: str,
+    response_data: Dict[str, Any],
+    session: Session,
+    interaction_id: str
+):
+    """
+    Display parsed JSON response in structured format,
+    similar to clinician_review_dashboard.py with two-column layout
+    """
+    parsed = parsed_data.get("parsed", {})
+    
+    # Add custom CSS for independent column scrolling
+    st.markdown("""
+    <style>
+    /* Create scrollable containers for each column */
+    .scrollable-container {
+        max-height: 85vh;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding-right: 10px;
+        padding-bottom: 20px;
+    }
+    /* Custom scrollbar styling */
+    .scrollable-container::-webkit-scrollbar {
+        width: 8px;
+    }
+    .scrollable-container::-webkit-scrollbar-track {
+        background: #f1f1f1;
+        border-radius: 10px;
+    }
+    .scrollable-container::-webkit-scrollbar-thumb {
+        background: #888;
+        border-radius: 10px;
+    }
+    .scrollable-container::-webkit-scrollbar-thumb:hover {
+        background: #555;
+    }
+    /* Firefox scrollbar */
+    .scrollable-container {
+        scrollbar-width: thin;
+        scrollbar-color: #888 #f1f1f1;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Two-column layout with independent scrolling
+    left_col, right_col = st.columns([1, 1], gap="large")
+    
+    # Left Column: User Input & LLM Annotation Summary
+    with left_col:
+        st.markdown('<div class="scrollable-container">', unsafe_allow_html=True)
+        
+        st.subheader("📝 Your Input")
+        st.text_area(
+            "",
+            value=user_input,
+            height=300,
+            disabled=True,
+            key="display_user_input"
+        )
+        
+        st.markdown("---")
+        
+        # LLM Annotation Summary
+        st.subheader("🤖 LLM Annotation Summary")
+        
+        summary_col1, summary_col2 = st.columns(2)
+        with summary_col1:
+            primary_group = parsed.get("primary_group", "N/A")
+            st.markdown(f"**Primary Group:** {primary_group}")
+            
+            primary_topic = parsed.get("primary_topic", "N/A")
+            st.markdown(f"**Primary Topic:** {primary_topic}")
+            
+            trimester = parsed.get("trimester", "N/A")
+            st.markdown(f"**Trimester:** {trimester}")
+        
+        with summary_col2:
+            sentiment = parsed.get("sentiment", "N/A")
+            st.markdown(f"**Sentiment:** {sentiment}")
+            
+            urgency = parsed.get("urgency_0_3", "N/A")
+            st.markdown(f"**Urgency (0-3):** {urgency}")
+            
+            confidence = parsed.get("model_confidence_score", "N/A")
+            if confidence != "N/A":
+                st.markdown(f"**Confidence:** {confidence}/100")
+        
+        # Secondary topics
+        secondary_topics = parsed.get("secondary_topics", [])
+        if secondary_topics:
+            st.markdown(f"**Secondary Topics:** {format_array_display(secondary_topics)}")
+        
+        # Post Summary
+        post_summary = parsed.get("post_summary", "")
+        if post_summary:
+            st.markdown("---")
+            st.markdown("**Post Summary:**")
+            st.info(post_summary)
+        
+        # Safety Flags
+        safety_flags = parsed.get("safety_flags", [])
+        if safety_flags:
+            st.markdown("---")
+            st.markdown("**Safety Flags:**")
+            st.warning(format_array_display(safety_flags))
+        
+        # Reasoning fields (if present)
+        classification_reasoning = parsed.get("classification_reasoning", "")
+        if classification_reasoning:
+            st.markdown("---")
+            st.markdown("### 🤔 Classification Reasoning")
+            with st.expander("View Reasoning", expanded=False):
+                st.text(classification_reasoning)
+        
+        safety_justification = parsed.get("safety_assessment_justification", "")
+        if safety_justification:
+            st.markdown("### 🛡️ Safety Assessment Justification")
+            with st.expander("View Justification", expanded=False):
+                st.text(safety_justification)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Right Column: Care Response & Review
+    with right_col:
+        st.markdown('<div class="scrollable-container">', unsafe_allow_html=True)
+        
+        # Keywords above Care Response (if present)
+        keywords = parsed.get("keywords", [])
+        if keywords:
+            st.markdown("**Keywords:**")
+            st.code(format_array_display(keywords))
+            st.markdown("---")
+        
+        # LLM-Generated Care Response
+        st.subheader("💬 LLM-Generated Care Response")
+        care_response = parsed.get("care_response", "")
+        if care_response:
+            st.text_area(
+                "",
+                value=care_response,
+                height=250,
+                disabled=True,
+                key="care_response_display"
+            )
+        else:
+            st.warning("No care response in JSON")
+        
+        # Safety Flags below Care Response
+        safety_flags = parsed.get("safety_flags", [])
+        if safety_flags:
+            st.markdown("**Safety Flags:**")
+            st.warning(format_array_display(safety_flags))
+        
+        st.markdown("---")
+        
+        # Review Section
+        st.subheader("⭐ Review This LLM Output")
+        
+        # Reviewer information
+        reviewer_name = st.text_input(
+            "Your Name (optional):",
+            key="reviewer_name"
+        )
+        
+        st.divider()
+        
+        # Rating
+        review_rating = st.slider(
+            "Rating (1-5):",
+            min_value=1,
+            max_value=5,
+            value=3,
+            help=(
+                "1 = Poor, 2 = Below Average, 3 = Average, "
+                "4 = Good, 5 = Excellent"
+            ),
+            key="review_rating"
+        )
+        
+        # Review feedback
+        review_feedback = st.text_area(
+            "Review Feedback:",
+            height=150,
+            placeholder="Provide your feedback on the LLM response...",
+            help=(
+                "Share your thoughts on the quality, accuracy, "
+                "usefulness, etc."
+            ),
+            key="review_feedback"
+        )
+        
+        # Submit review button
+        if st.button("💾 Save Review", type="primary", use_container_width=True, key="save_review_json"):
+            if not review_feedback.strip():
+                st.error("Please provide some review feedback.")
+            else:
+                with st.spinner("Saving review..."):
+                    success = update_interaction_review(
+                        session,
+                        interaction_id,
+                        review_feedback,
+                        review_rating,
+                        reviewer_name if reviewer_name.strip() else None
+                    )
+                    
+                    if success:
+                        st.success("✅ Review saved successfully!")
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to save review. Please try again.")
+        
+        st.markdown("---")
+        
+        # Metadata
+        st.markdown("### 📊 Metadata")
+        meta_col1, meta_col2 = st.columns(2)
+        with meta_col1:
+            model_name = response_data.get("model_name", "N/A")
+            st.caption(f"**Model:** {model_name}")
+            
+            input_tokens = response_data.get("input_tokens", 0)
+            st.caption(f"**Input Tokens:** {input_tokens}")
+        
+        with meta_col2:
+            output_tokens = response_data.get("output_tokens", 0)
+            st.caption(f"**Output Tokens:** {output_tokens}")
+            
+            prompt_hash = response_data.get("prompt_hash", "N/A")
+            if prompt_hash != "N/A":
+                st.caption(f"**Prompt Hash:** {prompt_hash[:8]}...")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ============================================================================
 # STREAMLIT UI
 # ============================================================================
 
@@ -590,8 +912,9 @@ def main():
         st.markdown("### Model Settings")
         model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         st.info(f"Using model: **{model_name}**")
-
-        if st.button("🔄 Reset Session"):
+        
+        st.markdown("---")
+        if st.button("🔄 Reset Session", key="reset_session", use_container_width=True):
             st.session_state.interaction_id = None
             st.session_state.llm_response = None
             st.session_state.interaction_saved = False
@@ -602,255 +925,246 @@ def main():
             )
             st.rerun()
     
-    # Main content area
-    tab1, tab2 = st.tabs(["📝 New Interaction", "✏️ Review & Save"])
+    # Main content area - single page layout
+    st.header("Create New LLM Interaction")
+    st.markdown("---")
     
-    with tab1:
-        st.header("Create New LLM Interaction")
+    # User input section
+    st.subheader("📥 Your Input")
+    user_input = st.text_area(
+        "Enter your text here:",
+        height=200,
+        placeholder="Type anything you want the LLM to process...",
+        key="user_input"
+    )
+    
+    # Prompt selection and editing section
+    st.subheader("🎯 Prompt Configuration")
+    
+    # Prompt selection mode
+    prompt_mode = st.radio(
+        "Prompt Selection Mode:",
+        ["Select by Hash", "Edit Prompts"],
+        horizontal=True,
+        key="prompt_mode"
+    )
+    
+    if prompt_mode == "Select by Hash":
+        # Get available prompts from folder
+        folder_prompts = scan_prompts_folder()
         
-        # User input section
-        st.subheader("📥 Your Input")
-        user_input = st.text_area(
-            "Enter your text here:",
-            height=200,
-            placeholder="Type anything you want the LLM to process...",
-            key="user_input"
+        # Get available hashes from Snowflake
+        snowflake_hashes = get_available_prompt_hashes_from_snowflake(
+            session
         )
         
-        # Prompt selection and editing section
-        st.subheader("🎯 Prompt Configuration")
+        # Combine and deduplicate
+        all_hashes = set()
+        hash_to_prompt = {}
         
-        # Prompt selection mode
-        prompt_mode = st.radio(
-            "Prompt Selection Mode:",
-            ["Select by Hash", "Edit Prompts"],
-            horizontal=True,
-            key="prompt_mode"
-        )
+        for prompt in folder_prompts:
+            hash_val = prompt['prompt_hash']
+            all_hashes.add(hash_val)
+            hash_to_prompt[hash_val] = prompt
         
-        if prompt_mode == "Select by Hash":
-            # Get available prompts from folder
-            folder_prompts = scan_prompts_folder()
-            
-            # Get available hashes from Snowflake
-            snowflake_hashes = get_available_prompt_hashes_from_snowflake(
-                session
-            )
-            
-            # Combine and deduplicate
-            all_hashes = set()
-            hash_to_prompt = {}
-            
-            for prompt in folder_prompts:
-                hash_val = prompt['prompt_hash']
-                all_hashes.add(hash_val)
-                hash_to_prompt[hash_val] = prompt
-            
-            for hash_val in snowflake_hashes:
-                all_hashes.add(hash_val)
-                # Try to find in folder prompts
-                if hash_val not in hash_to_prompt:
-                    found = get_prompt_by_hash(hash_val)
-                    if found:
-                        hash_to_prompt[hash_val] = found
-            
-            # Create options list
-            hash_options = sorted(list(all_hashes))
-            
-            if hash_options:
-                def format_hash_option(x):
-                    if x in hash_to_prompt and 'display_name' in hash_to_prompt[x]:
-                        name = hash_to_prompt[x]['display_name']
-                    else:
-                        name = 'from Snowflake'
-                    return f"{x} ({name})"
+        for hash_val in snowflake_hashes:
+            all_hashes.add(hash_val)
+            # Try to find in folder prompts
+            if hash_val not in hash_to_prompt:
+                found = get_prompt_by_hash(hash_val)
+                if found:
+                    hash_to_prompt[hash_val] = found
+        
+        # Create options list
+        hash_options = sorted(list(all_hashes))
+        
+        if hash_options:
+            def format_hash_option(x):
+                if x in hash_to_prompt and 'display_name' in hash_to_prompt[x]:
+                    name = hash_to_prompt[x]['display_name']
+                else:
+                    name = 'from Snowflake'
+                return f"{x} ({name})"
 
-                selected_hash = st.selectbox(
-                    "Select Prompt by Hash:",
-                    options=hash_options,
-                    format_func=format_hash_option,
-                    key="selected_prompt_hash"
-                )
-                
-                if st.button("Load Selected Prompt", key="load_prompt"):
-                    if selected_hash in hash_to_prompt:
-                        prompt_data = hash_to_prompt[selected_hash]
-                        system_prompt = prompt_data['system_prompt']
-                        user_prompt = prompt_data['user_prompt']
-                        
-                        # Replace {post_text} with {user_input} for compatibility
-                        # Also replace {post_id} with a placeholder
-                        user_prompt = user_prompt.replace("{post_text}", "{user_input}")
-                        user_prompt = user_prompt.replace("{post_id}", "{user_input}")
-                        
-                        # Recalculate hash with updated prompt
-                        new_hash = calculate_prompt_hash(system_prompt, user_prompt)
-                        
-                        st.session_state.system_prompt = system_prompt
-                        st.session_state.user_prompt = user_prompt
-                        st.session_state.prompt_hash = new_hash
-                        st.success(
-                            f"✅ Loaded prompt with hash: {selected_hash[:8]}... "
-                            f"(updated to {new_hash[:8]}...)"
-                        )
-                        st.rerun()
-                    else:
-                        st.warning(
-                            f"Prompt hash {selected_hash} found in Snowflake "
-                            "but not in prompts folder. Please use 'Edit "
-                            "Prompts' mode to recreate it."
-                        )
-            else:
-                st.info("No prompts found. Use 'Edit Prompts' mode to create one.")
-        
-        else:  # Edit Prompts mode
-            st.markdown("**Edit System and User Prompts:**")
-            
-            system_prompt = st.text_area(
-                "System Prompt:",
-                value=st.session_state.system_prompt,
-                height=200,
-                help="System prompt (instructions for the LLM)",
-                key="system_prompt_editor"
+            selected_hash = st.selectbox(
+                "Select Prompt by Hash:",
+                options=hash_options,
+                format_func=format_hash_option,
+                key="selected_prompt_hash"
             )
             
-            user_prompt = st.text_area(
-                "User Prompt Template:",
-                value=st.session_state.user_prompt,
-                height=200,
-                help=(
-                    "User prompt template. Use {user_input}, {post_text}, "
-                    "or {post_id} as placeholders. They will all be "
-                    "replaced with your input text."
-                ),
-                key="user_prompt_editor"
-            )
-            
-            # Calculate and display hash
-            new_hash = calculate_prompt_hash(system_prompt, user_prompt)
-            
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.info(f"**Prompt Hash:** `{new_hash}`")
-            with col2:
-                if st.button("💾 Save Prompts", key="save_prompts"):
+            if st.button("Load Selected Prompt", key="load_prompt"):
+                if selected_hash in hash_to_prompt:
+                    prompt_data = hash_to_prompt[selected_hash]
+                    system_prompt = prompt_data['system_prompt']
+                    user_prompt = prompt_data['user_prompt']
+                    
+                    # Replace {post_text} with {user_input} for compatibility
+                    # Also replace {post_id} with a placeholder
+                    user_prompt = user_prompt.replace("{post_text}", "{user_input}")
+                    user_prompt = user_prompt.replace("{post_id}", "{user_input}")
+                    
+                    # Recalculate hash with updated prompt
+                    new_hash = calculate_prompt_hash(system_prompt, user_prompt)
+                    
                     st.session_state.system_prompt = system_prompt
                     st.session_state.user_prompt = user_prompt
                     st.session_state.prompt_hash = new_hash
-                    st.success(f"✅ Prompts saved! Hash: {new_hash}")
-                    st.rerun()
-        
-        # Display current prompts
-        st.markdown("---")
-        with st.expander("📋 View Current Prompts", expanded=False):
-            st.markdown("**System Prompt:**")
-            # Use dynamic key based on hash to force refresh when prompts change
-            system_key = f"display_system_{st.session_state.prompt_hash[:8]}"
-            st.text_area(
-                "System",
-                value=st.session_state.system_prompt,
-                height=150,
-                disabled=True,
-                key=system_key
-            )
-            st.markdown("**User Prompt:**")
-            # Use dynamic key based on hash to force refresh when prompts change
-            user_key = f"display_user_{st.session_state.prompt_hash[:8]}"
-            st.text_area(
-                "User",
-                value=st.session_state.user_prompt,
-                height=150,
-                disabled=True,
-                key=user_key
-            )
-            st.caption(f"**Current Hash:** `{st.session_state.prompt_hash}`")
-        
-        # Validate user prompt has placeholder
-        has_placeholder = bool(
-            re.search(r'\{[^}]+\}', st.session_state.user_prompt)
-        )
-        if not has_placeholder:
-            warning_msg = (
-                "⚠️ Your user prompt template should include a placeholder "
-                "like `{user_input}`, `{post_text}`, etc."
-            )
-            st.warning(warning_msg)
-
-        # Generate LLM response
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            generate_button = st.button(
-                "🚀 Generate Response",
-                type="primary",
-                use_container_width=True
-            )
-        
-        if generate_button:
-            if not user_input.strip():
-                st.error("Please enter some text input first.")
-            else:
-                # Check for any placeholder pattern
-                has_placeholder = bool(
-                    re.search(r'\{[^}]+\}', st.session_state.user_prompt)
-                )
-                if not has_placeholder:
-                    error_msg = (
-                        "Please include a placeholder (e.g., `{user_input}`, "
-                        "`{post_text}`) in your user prompt template."
+                    st.success(
+                        f"✅ Loaded prompt with hash: {selected_hash[:8]}... "
+                        f"(updated to {new_hash[:8]}...)"
                     )
-                    st.error(error_msg)
+                    st.rerun()
                 else:
-                    with st.spinner("Calling LLM..."):
-                        result = call_llm(
-                            user_input,
-                            st.session_state.system_prompt,
-                            st.session_state.user_prompt,
-                            st.session_state.prompt_hash
+                    st.warning(
+                        f"Prompt hash {selected_hash} found in Snowflake "
+                        "but not in prompts folder. Please use 'Edit "
+                        "Prompts' mode to recreate it."
+                    )
+        else:
+            st.info("No prompts found. Use 'Edit Prompts' mode to create one.")
+    
+    else:  # Edit Prompts mode
+        st.markdown("**Edit System and User Prompts:**")
+        
+        system_prompt = st.text_area(
+            "System Prompt:",
+            value=st.session_state.system_prompt,
+            height=200,
+            help="System prompt (instructions for the LLM)",
+            key="system_prompt_editor"
+        )
+        
+        user_prompt = st.text_area(
+            "User Prompt Template:",
+            value=st.session_state.user_prompt,
+            height=200,
+            help=(
+                "User prompt template. Use {user_input}, {post_text}, "
+                "or {post_id} as placeholders. They will all be "
+                "replaced with your input text."
+            ),
+            key="user_prompt_editor"
+        )
+        
+        # Calculate and display hash
+        new_hash = calculate_prompt_hash(system_prompt, user_prompt)
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info(f"**Prompt Hash:** `{new_hash}`")
+        with col2:
+            if st.button("💾 Save Prompts", key="save_prompts"):
+                st.session_state.system_prompt = system_prompt
+                st.session_state.user_prompt = user_prompt
+                st.session_state.prompt_hash = new_hash
+                st.success(f"✅ Prompts saved! Hash: {new_hash}")
+                st.rerun()
+    
+    # Display current prompts
+    st.markdown("---")
+    with st.expander("📋 View Current Prompts", expanded=False):
+        st.markdown("**System Prompt:**")
+        # Use dynamic key based on hash to force refresh when prompts change
+        system_key = f"display_system_{st.session_state.prompt_hash[:8]}"
+        st.text_area(
+            "System",
+            value=st.session_state.system_prompt,
+            height=150,
+            disabled=True,
+            key=system_key
+        )
+        st.markdown("**User Prompt:**")
+        # Use dynamic key based on hash to force refresh when prompts change
+        user_key = f"display_user_{st.session_state.prompt_hash[:8]}"
+        st.text_area(
+            "User",
+            value=st.session_state.user_prompt,
+            height=150,
+            disabled=True,
+            key=user_key
+        )
+        st.caption(f"**Current Hash:** `{st.session_state.prompt_hash}`")
+    
+    # Validate user prompt has placeholder
+    has_placeholder = bool(
+        re.search(r'\{[^}]+\}', st.session_state.user_prompt)
+    )
+    if not has_placeholder:
+        warning_msg = (
+            "⚠️ Your user prompt template should include a placeholder "
+            "like `{user_input}`, `{post_text}`, etc."
+        )
+        st.warning(warning_msg)
+
+    # Generate LLM response
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        generate_button = st.button(
+            "🚀 Generate Response",
+            type="primary",
+            use_container_width=True
+        )
+    
+    if generate_button:
+        if not user_input.strip():
+            st.error("Please enter some text input first.")
+        else:
+            # Check for any placeholder pattern
+            has_placeholder = bool(
+                re.search(r'\{[^}]+\}', st.session_state.user_prompt)
+            )
+            if not has_placeholder:
+                error_msg = (
+                    "Please include a placeholder (e.g., `{user_input}`, "
+                    "`{post_text}`) in your user prompt template."
+                )
+                st.error(error_msg)
+            else:
+                # Detect if JSON format should be requested
+                # (check if prompts mention JSON or JSON schema)
+                system_prompt_lower = st.session_state.system_prompt.lower()
+                user_prompt_lower = st.session_state.user_prompt.lower()
+                request_json = (
+                    "json" in system_prompt_lower or
+                    "json" in user_prompt_lower or
+                    "json schema" in system_prompt_lower or
+                    "json schema" in user_prompt_lower
+                )
+                
+                with st.spinner("Calling LLM..."):
+                    result = call_llm(
+                        user_input,
+                        st.session_state.system_prompt,
+                        st.session_state.user_prompt,
+                        st.session_state.prompt_hash,
+                        request_json=request_json
+                    )
+
+                    if result:
+                        st.session_state.llm_response = result
+                        st.session_state.interaction_id = str(uuid.uuid4())
+                        st.session_state.interaction_saved = False
+                        st.success("✅ LLM response generated!")
+                        st.rerun()
+                    else:
+                        st.error(
+                            "Failed to generate response. "
+                            "Please try again."
                         )
 
-                        if result:
-                            st.session_state.llm_response = result
-                            st.session_state.interaction_id = str(uuid.uuid4())
-                            st.session_state.interaction_saved = False
-                            st.success("✅ LLM response generated!")
-                            st.rerun()
-                        else:
-                            st.error(
-                                "Failed to generate response. "
-                                "Please try again."
-                            )
-
-        # Display LLM response if available
-        if st.session_state.llm_response:
+    # Display LLM response if available
+    if st.session_state.llm_response:
             st.markdown("---")
-            st.subheader("🤖 LLM Response")
+            st.header("🤖 LLM Response & Review")
             
             response_data = st.session_state.llm_response
-            st.text_area(
-                "Response:",
-                value=response_data['response'],
-                height=300,
-                disabled=True,
-                key="llm_response_display"
-            )
+            response_text = response_data['response']
             
-            # Show metadata
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Input Tokens", response_data['input_tokens'])
-            with col2:
-                st.metric("Output Tokens", response_data['output_tokens'])
-            with col3:
-                st.metric("Model", response_data['model_name'])
-            with col4:
-                prompt_hash_display = response_data.get(
-                    'prompt_hash', st.session_state.prompt_hash
-                )
-                short_hash = prompt_hash_display[:8] + "..."
-                st.metric("Prompt Hash", short_hash)
-                st.caption(f"Full: {prompt_hash_display}")
+            # Parse the response
+            parsed_response = parse_llm_response(response_text)
             
-            # Auto-save interaction (without review)
+            # Auto-save interaction (without review) if not saved yet
             if not st.session_state.interaction_saved:
                 with st.spinner("Saving interaction..."):
                     success = save_interaction(
@@ -871,114 +1185,163 @@ def main():
                         st.success("✅ Interaction saved to Snowflake!")
                     else:
                         st.error("❌ Failed to save interaction.")
-    
-    with tab2:
-        st.header("Review & Provide Feedback")
-
-        if (not st.session_state.llm_response or
-                not st.session_state.interaction_id):
-            info_msg = (
-                "👆 Please generate an LLM response first in the "
-                "'New Interaction' tab."
-            )
-            st.info(info_msg)
-        else:
-            # Display current interaction
-            st.subheader("📋 Current Interaction")
-
-            col1, col2 = st.columns(2)
             
-            with col1:
-                st.markdown("**Your Input:**")
-                st.text_area(
-                    "Input",
-                    value=st.session_state.get("user_input", ""),
-                    height=150,
-                    disabled=True,
-                    key="review_input_display"
+            # Display mode toggle (only show if JSON detected)
+            if parsed_response.get("is_json"):
+                display_mode = st.radio(
+                    "Display Mode:",
+                    ["Structured View", "Raw Response"],
+                    horizontal=True,
+                    key="display_mode"
                 )
+            else:
+                display_mode = "Raw Response"
             
-            with col2:
-                st.markdown("**LLM Output:**")
-                st.text_area(
-                    "Output",
-                    value=st.session_state.llm_response['response'],
-                    height=150,
-                    disabled=True,
-                    key="review_output_display"
+            if display_mode == "Structured View" and parsed_response.get("is_json"):
+                # Display parsed JSON in structured format with review
+                display_parsed_json_response(
+                    parsed_response,
+                    user_input,
+                    response_data,
+                    session,
+                    st.session_state.interaction_id
                 )
-            
-            # Review form
-            st.markdown("---")
-            st.subheader("✏️ Your Review")
-
-            with st.form("review_form", clear_on_submit=False):
-                reviewer_name = st.text_input(
-                    "Your Name (optional):",
-                    placeholder="Enter your name",
-                    key="reviewer_name"
-                )
-
-                review_rating = st.slider(
-                    "Rating (1-5):",
-                    min_value=1,
-                    max_value=5,
-                    value=3,
-                    help=(
-                        "1 = Poor, 2 = Below Average, 3 = Average, "
-                        "4 = Good, 5 = Excellent"
-                    ),
-                    key="review_rating"
-                )
-
-                review_feedback = st.text_area(
-                    "Review Feedback:",
-                    height=200,
-                    placeholder="Provide your feedback on the LLM response...",
-                    help=(
-                        "Share your thoughts on the quality, accuracy, "
-                        "usefulness, etc."
-                    ),
-                    key="review_feedback"
-                )
-
-                submitted = st.form_submit_button(
-                    "💾 Save Review",
-                    use_container_width=True,
-                    type="primary"
-                )
-
-                if submitted:
-                    if not review_feedback.strip():
-                        st.error("Please provide some review feedback.")
-                    else:
-                        # Update interaction with review
-                        with st.spinner("Saving review..."):
-                            success = update_interaction_review(
-                                session,
-                                st.session_state.interaction_id,
-                                review_feedback,
-                                review_rating,
-                                reviewer_name if reviewer_name.strip()
-                                else None
-                            )
-
-                            if success:
-                                st.success("✅ Review saved successfully!")
-                                st.balloons()
-
-                                # Option to create new interaction
-                                if st.button("🆕 Create New Interaction"):
-                                    st.session_state.interaction_id = None
-                                    st.session_state.llm_response = None
-                                    st.session_state.interaction_saved = False
-                                    st.rerun()
-                            else:
-                                error_msg = (
-                                    "❌ Failed to save review. "
-                                    "Please try again."
+            else:
+                # Display raw response in two-column layout
+                # Add custom CSS for independent column scrolling
+                st.markdown("""
+                <style>
+                /* Create scrollable containers for each column */
+                .scrollable-container {
+                    max-height: 85vh;
+                    overflow-y: auto;
+                    overflow-x: hidden;
+                    padding-right: 10px;
+                    padding-bottom: 20px;
+                }
+                /* Custom scrollbar styling */
+                .scrollable-container::-webkit-scrollbar {
+                    width: 8px;
+                }
+                .scrollable-container::-webkit-scrollbar-track {
+                    background: #f1f1f1;
+                    border-radius: 10px;
+                }
+                .scrollable-container::-webkit-scrollbar-thumb {
+                    background: #888;
+                    border-radius: 10px;
+                }
+                .scrollable-container::-webkit-scrollbar-thumb:hover {
+                    background: #555;
+                }
+                /* Firefox scrollbar */
+                .scrollable-container {
+                    scrollbar-width: thin;
+                    scrollbar-color: #888 #f1f1f1;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                # Two-column layout for raw response
+                left_col, right_col = st.columns([1, 1], gap="large")
+                
+                with left_col:
+                    st.markdown('<div class="scrollable-container">', unsafe_allow_html=True)
+                    st.subheader("📝 Your Input")
+                    st.text_area(
+                        "",
+                        value=user_input,
+                        height=400,
+                        disabled=True,
+                        key="raw_input_display"
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                with right_col:
+                    st.markdown('<div class="scrollable-container">', unsafe_allow_html=True)
+                    st.subheader("🤖 LLM Response")
+                    st.text_area(
+                        "",
+                        value=response_text,
+                        height=300,
+                        disabled=True,
+                        key="raw_response_display"
+                    )
+                    
+                    st.markdown("---")
+                    st.subheader("⭐ Review This LLM Output")
+                    
+                    reviewer_name = st.text_input(
+                        "Your Name (optional):",
+                        key="reviewer_name_raw"
+                    )
+                    
+                    review_rating = st.slider(
+                        "Rating (1-5):",
+                        min_value=1,
+                        max_value=5,
+                        value=3,
+                        help=(
+                            "1 = Poor, 2 = Below Average, 3 = Average, "
+                            "4 = Good, 5 = Excellent"
+                        ),
+                        key="review_rating_raw"
+                    )
+                    
+                    review_feedback = st.text_area(
+                        "Review Feedback:",
+                        height=150,
+                        placeholder="Provide your feedback...",
+                        key="review_feedback_raw"
+                    )
+                    
+                    if st.button("💾 Save Review", type="primary", use_container_width=True, key="save_review_raw"):
+                        if not review_feedback.strip():
+                            st.error("Please provide some review feedback.")
+                        else:
+                            with st.spinner("Saving review..."):
+                                success = update_interaction_review(
+                                    session,
+                                    st.session_state.interaction_id,
+                                    review_feedback,
+                                    review_rating,
+                                    reviewer_name if reviewer_name.strip() else None
                                 )
-                                st.error(error_msg)
+                                
+                                if success:
+                                    st.success("✅ Review saved successfully!")
+                                    st.balloons()
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Failed to save review.")
+                    
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                if parsed_response.get("is_json"):
+                    st.info("💡 Toggle to 'Structured View' to see parsed JSON")
+                else:
+                    st.warning(
+                        "⚠️ Response is not valid JSON. "
+                        "Showing raw text output."
+                    )
+            
+            # Show token usage metadata below
+            st.markdown("---")
+            st.markdown("### 📊 Token Usage")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Input Tokens", response_data['input_tokens'])
+            with col2:
+                st.metric("Output Tokens", response_data['output_tokens'])
+            with col3:
+                st.metric("Model", response_data['model_name'])
+            with col4:
+                prompt_hash_display = response_data.get(
+                    'prompt_hash', st.session_state.prompt_hash
+                )
+                short_hash = prompt_hash_display[:8] + "..."
+                st.metric("Prompt Hash", short_hash)
+                st.caption(f"Full: {prompt_hash_display}")
 
     # Footer
     st.markdown("---")
