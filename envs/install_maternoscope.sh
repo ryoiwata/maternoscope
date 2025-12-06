@@ -97,3 +97,6 @@ conda install conda-forge::praw --yes
 conda install conda-forge::streamlit --yes
 
 pip install snowflake-snowpark-python
+
+
+conda install anaconda::langchain-openai  --yes

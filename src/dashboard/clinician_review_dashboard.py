@@ -77,23 +77,21 @@ def create_ratings_table_if_not_exists():
         cursor.execute(schema_sql)
 
         # Create ratings table
+        # Note: Snowflake doesn't support inline CHECK constraints
+        # Validation should be handled in the application layer
         create_table_sql = """
         CREATE TABLE IF NOT EXISTS
         MATERNOSCOPE.ANALYTICS_REF.CLINICIAN_RATINGS (
             RATING_ID VARCHAR(255) PRIMARY KEY,
             POST_ID VARCHAR(255) NOT NULL,
+            PROMPT_HASH VARCHAR(50),
             CLINICIAN_NAME VARCHAR(255) NOT NULL,
             CLINICIAN_EMAIL VARCHAR(255),
-            RATING_OVERALL NUMBER(1,0) NOT NULL
-                CHECK (RATING_OVERALL >= 1 AND RATING_OVERALL <= 5),
-            RATING_ACCURACY NUMBER(1,0)
-                CHECK (RATING_ACCURACY >= 1 AND RATING_ACCURACY <= 5),
-            RATING_EMPATHY NUMBER(1,0)
-                CHECK (RATING_EMPATHY >= 1 AND RATING_EMPATHY <= 5),
-            RATING_SAFETY NUMBER(1,0)
-                CHECK (RATING_SAFETY >= 1 AND RATING_SAFETY <= 5),
-            RATING_RELEVANCE NUMBER(1,0)
-                CHECK (RATING_RELEVANCE >= 1 AND RATING_RELEVANCE <= 5),
+            RATING_OVERALL NUMBER(1,0) NOT NULL,
+            RATING_ACCURACY NUMBER(1,0),
+            RATING_EMPATHY NUMBER(1,0),
+            RATING_SAFETY NUMBER(1,0),
+            RATING_RELEVANCE NUMBER(1,0),
             COMMENTS VARCHAR(5000),
             RATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
             CREATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
@@ -101,6 +99,29 @@ def create_ratings_table_if_not_exists():
         """
         
         cursor.execute(create_table_sql)
+        
+        # Check and add PROMPT_HASH column for existing tables (migration support)
+        try:
+            check_column_sql = """
+            SELECT COUNT(*) 
+            FROM INFORMATION_SCHEMA.COLUMNS 
+            WHERE TABLE_SCHEMA = 'ANALYTICS_REF' 
+            AND TABLE_NAME = 'CLINICIAN_RATINGS' 
+            AND COLUMN_NAME = 'PROMPT_HASH'
+            """
+            cursor.execute(check_column_sql)
+            column_exists = cursor.fetchone()[0] > 0
+            
+            if not column_exists:
+                alter_table_sql = """
+                ALTER TABLE MATERNOSCOPE.ANALYTICS_REF.CLINICIAN_RATINGS 
+                ADD COLUMN PROMPT_HASH VARCHAR(50)
+                """
+                cursor.execute(alter_table_sql)
+        except Exception:
+            # Column might already exist or table doesn't exist yet
+            pass
+        
         cursor.close()
         return True
     except Exception as e:
@@ -111,14 +132,20 @@ def create_ratings_table_if_not_exists():
 def fetch_posts(limit: int = 100,
                 subreddit: Optional[str] = None,
                 primary_topic: Optional[str] = None,
-                urgency_min: Optional[int] = None):
-    """Fetch posts from Snowflake for review."""
+                urgency_min: Optional[int] = None,
+                prompt_hash: Optional[str] = None,
+                reviewed_filter: Optional[str] = None):
+    """Fetch posts from Snowflake for review.
+    
+    Args:
+        reviewed_filter: "all", "reviewed", or "not_reviewed"
+    """
     conn = connect_snowflake()
     if conn is None:
         return None
 
     try:
-        # Join REDDIT_POSTS_ANNOTATED with staging table to get post metadata
+        # Join REDDIT_POSTS_ANNOTATED with staging table and ratings table
         query = """
         SELECT
             a.POST_ID,
@@ -138,10 +165,18 @@ def fetch_posts(limit: int = 100,
             a.SAFETY_FLAGS,
             a.MODEL_NAME,
             a.MODEL_VERSION,
-            a.ANNOTATED_AT
+            a.PROMPT_HASH,
+            a.ANNOTATED_AT,
+            CASE WHEN r.RATING_ID IS NOT NULL
+                THEN TRUE ELSE FALSE END as IS_REVIEWED
         FROM MATERNOSCOPE.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED a
         LEFT JOIN MATERNOSCOPE.BRONZE.STG_REDDIT_POSTS_PII s
             ON a.POST_ID = s.POST_ID
+        LEFT JOIN MATERNOSCOPE.ANALYTICS_REF.CLINICIAN_RATINGS r
+            ON a.POST_ID = r.POST_ID
+            AND (a.PROMPT_HASH = r.PROMPT_HASH
+                 OR (a.PROMPT_HASH IS NULL
+                     AND r.PROMPT_HASH IS NULL))
         WHERE a.CARE_RESPONSE IS NOT NULL
         """
         
@@ -154,6 +189,14 @@ def fetch_posts(limit: int = 100,
             )
         if urgency_min is not None:
             conditions.append(f"a.URGENCY_0_3 >= {urgency_min}")
+        if prompt_hash:
+            conditions.append(
+                f"a.PROMPT_HASH = '{prompt_hash.replace("'", "''")}'"
+            )
+        if reviewed_filter == "reviewed":
+            conditions.append("r.RATING_ID IS NOT NULL")
+        elif reviewed_filter == "not_reviewed":
+            conditions.append("r.RATING_ID IS NULL")
         
         if conditions:
             query += " AND " + " AND ".join(conditions)
@@ -184,14 +227,65 @@ def fetch_posts(limit: int = 100,
         return None
 
 
-def submit_rating(post_id: str, clinician_name: str,
-                 clinician_email: str, rating_overall: int,
-                 rating_accuracy: Optional[int],
-                 rating_empathy: Optional[int],
-                 rating_safety: Optional[int],
-                 rating_relevance: Optional[int],
-                 comments: str) -> bool:
+def get_available_subreddits():
+    """Fetch list of available subreddits from Snowflake."""
+    conn = connect_snowflake()
+    if conn is None:
+        return []
+    
+    try:
+        query = """
+        SELECT DISTINCT s.SUBREDDIT
+        FROM MATERNOSCOPE.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED a
+        LEFT JOIN MATERNOSCOPE.BRONZE.STG_REDDIT_POSTS_PII s
+            ON a.POST_ID = s.POST_ID
+        WHERE a.CARE_RESPONSE IS NOT NULL
+            AND s.SUBREDDIT IS NOT NULL
+        ORDER BY s.SUBREDDIT
+        """
+        
+        df = pd.read_sql(query, conn)
+        subreddits = df['SUBREDDIT'].dropna().unique().tolist()
+        return sorted(subreddits) if subreddits else []
+    except Exception as e:
+        st.error(f"Error fetching subreddits: {e}")
+        return []
+
+
+def get_available_prompt_hashes():
+    """Fetch list of available prompt hashes from Snowflake."""
+    conn = connect_snowflake()
+    if conn is None:
+        return []
+    
+    try:
+        query = """
+        SELECT DISTINCT a.PROMPT_HASH
+        FROM MATERNOSCOPE.ANALYTICS_ML.REDDIT_POSTS_ANNOTATED a
+        WHERE a.CARE_RESPONSE IS NOT NULL
+            AND a.PROMPT_HASH IS NOT NULL
+        ORDER BY a.PROMPT_HASH
+        """
+        
+        df = pd.read_sql(query, conn)
+        prompt_hashes = df['PROMPT_HASH'].dropna().unique().tolist()
+        return sorted(prompt_hashes) if prompt_hashes else []
+    except Exception as e:
+        st.error(f"Error fetching prompt hashes: {e}")
+        return []
+
+
+def submit_rating(post_id: str, prompt_hash: Optional[str],
+                 clinician_name: str, clinician_email: str,
+                 rating_overall: int, rating_accuracy: Optional[int],
+                 rating_empathy: Optional[int], rating_safety: Optional[int],
+                 rating_relevance: Optional[int], comments: str) -> bool:
     """Submit a rating to Snowflake."""
+    # Ensure the ratings table exists before attempting to insert
+    if not create_ratings_table_if_not_exists():
+        st.error("Failed to create or verify ratings table.")
+        return False
+    
     conn = connect_snowflake()
     if conn is None:
         return False
@@ -204,26 +298,60 @@ def submit_rating(post_id: str, clinician_name: str,
                     f"{datetime.now(timezone.utc).isoformat()}")
         rating_id = rating_id.replace(':', '-').replace('.', '-')[:255]
 
-        insert_sql = """
+        # Escape single quotes in string values to prevent SQL injection
+        def escape_sql_string(value):
+            if value is None or value == '':
+                return 'NULL'
+            # Escape single quotes by doubling them
+            escaped = str(value).replace("'", "''")
+            return f"'{escaped}'"
+        
+        # Format values for SQL
+        rating_id_escaped = escape_sql_string(rating_id)
+        post_id_escaped = escape_sql_string(post_id)
+        prompt_hash_escaped = escape_sql_string(prompt_hash)
+        clinician_name_escaped = escape_sql_string(clinician_name)
+        clinician_email_escaped = escape_sql_string(
+            clinician_email if clinician_email else None
+        )
+        comments_escaped = escape_sql_string(comments if comments else None)
+        
+        # Format numeric values (handle None)
+        rating_accuracy_val = (
+            str(rating_accuracy) if rating_accuracy is not None else 'NULL'
+        )
+        rating_empathy_val = (
+            str(rating_empathy) if rating_empathy is not None else 'NULL'
+        )
+        rating_safety_val = (
+            str(rating_safety) if rating_safety is not None else 'NULL'
+        )
+        rating_relevance_val = (
+            str(rating_relevance) if rating_relevance is not None else 'NULL'
+        )
+        
+        insert_sql = f"""
         INSERT INTO MATERNOSCOPE.ANALYTICS_REF.CLINICIAN_RATINGS (
-            RATING_ID, POST_ID, CLINICIAN_NAME, CLINICIAN_EMAIL,
+            RATING_ID, POST_ID, PROMPT_HASH, CLINICIAN_NAME, CLINICIAN_EMAIL,
             RATING_OVERALL, RATING_ACCURACY, RATING_EMPATHY,
-            RATING_SAFETY, RATING_RELEVANCE, COMMENTS
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RATING_SAFETY, RATING_RELEVANCE, COMMENTS, RATED_AT
+        ) VALUES (
+            {rating_id_escaped},
+            {post_id_escaped},
+            {prompt_hash_escaped},
+            {clinician_name_escaped},
+            {clinician_email_escaped},
+            {rating_overall},
+            {rating_accuracy_val},
+            {rating_empathy_val},
+            {rating_safety_val},
+            {rating_relevance_val},
+            {comments_escaped},
+            CURRENT_TIMESTAMP()
+        )
         """
         
-        cursor.execute(insert_sql, (
-            rating_id,
-            post_id,
-            clinician_name,
-            clinician_email if clinician_email else None,
-            rating_overall,
-            rating_accuracy if rating_accuracy else None,
-            rating_empathy if rating_empathy else None,
-            rating_safety if rating_safety else None,
-            rating_relevance if rating_relevance else None,
-            comments if comments else None
-        ))
+        cursor.execute(insert_sql)
         
         conn.commit()
         cursor.close()
@@ -241,11 +369,14 @@ def main():
     st.markdown("Review and rate LLM-generated annotations "
                 "for Reddit posts")
     
+    # Ensure ratings table exists on startup
+    create_ratings_table_if_not_exists()
+    
     # Sidebar for filters and navigation
     with st.sidebar:
         st.header("🔍 Filters")
         
-        # Initialize ratings table
+        # Initialize ratings table (manual button for re-creation if needed)
         if st.button("Initialize Ratings Table"):
             with st.spinner("Creating ratings table..."):
                 if create_ratings_table_if_not_exists():
@@ -260,8 +391,16 @@ def main():
                                 min_value=10, max_value=1000,
                                 value=100, step=10)
 
-        subreddit_filter = st.text_input("Filter by Subreddit (optional)",
-                                        "")
+        # Get available subreddits for dropdown
+        available_subreddits = get_available_subreddits()
+        subreddit_options = [None] + available_subreddits
+        
+        subreddit_filter = st.selectbox(
+            "Filter by Subreddit (optional)",
+            options=subreddit_options,
+            format_func=lambda x: "All Subreddits" if x is None else x,
+            index=0
+        )
         topics = [
             None, "symptoms_body_changes", "medications_supplements",
             "test_results_labs", "pregnancy_complications", "labor_delivery",
@@ -290,13 +429,43 @@ def main():
                                   else f"Urgency {x}+")
         )
         
+        # Get available prompt hashes for dropdown
+        available_prompt_hashes = get_available_prompt_hashes()
+        prompt_hash_options = [None] + available_prompt_hashes
+        
+        def format_prompt_hash(x):
+            if x is None:
+                return "All Prompts"
+            x_str = str(x)
+            return x_str[:20] + "..." if len(x_str) > 20 else x_str
+        
+        prompt_hash_filter = st.selectbox(
+            "Filter by Prompt Hash (optional)",
+            options=prompt_hash_options,
+            format_func=format_prompt_hash,
+            index=0
+        )
+        
+        reviewed_filter = st.selectbox(
+            "Filter by Review Status",
+            options=["all", "reviewed", "not_reviewed"],
+            format_func=lambda x: {
+                "all": "All Posts",
+                "reviewed": "Reviewed Posts",
+                "not_reviewed": "Not Reviewed Posts"
+            }[x],
+            index=0
+        )
+        
         if st.button("🔄 Load Posts", type="primary"):
             with st.spinner("Loading posts from Snowflake..."):
                 df = fetch_posts(
                     limit=limit,
                     subreddit=subreddit_filter if subreddit_filter else None,
                     primary_topic=primary_topic_filter,
-                    urgency_min=urgency_filter
+                    urgency_min=urgency_filter,
+                    prompt_hash=prompt_hash_filter if prompt_hash_filter else None,
+                    reviewed_filter=reviewed_filter
                 )
                 if df is not None and len(df) > 0:
                     st.session_state.posts_df = df
@@ -377,27 +546,33 @@ def main():
         # Add custom CSS for independent column scrolling
         st.markdown("""
         <style>
-        /* Target Streamlit columns for independent scrolling */
-        div[data-testid="column"] {
+        /* Create scrollable containers for each column */
+        .scrollable-container {
             max-height: 85vh;
             overflow-y: auto;
             overflow-x: hidden;
             padding-right: 10px;
+            padding-bottom: 20px;
         }
         /* Custom scrollbar styling */
-        div[data-testid="column"]::-webkit-scrollbar {
+        .scrollable-container::-webkit-scrollbar {
             width: 8px;
         }
-        div[data-testid="column"]::-webkit-scrollbar-track {
+        .scrollable-container::-webkit-scrollbar-track {
             background: #f1f1f1;
             border-radius: 10px;
         }
-        div[data-testid="column"]::-webkit-scrollbar-thumb {
+        .scrollable-container::-webkit-scrollbar-thumb {
             background: #888;
             border-radius: 10px;
         }
-        div[data-testid="column"]::-webkit-scrollbar-thumb:hover {
+        .scrollable-container::-webkit-scrollbar-thumb:hover {
             background: #555;
+        }
+        /* Firefox scrollbar */
+        .scrollable-container {
+            scrollbar-width: thin;
+            scrollbar-color: #888 #f1f1f1;
         }
         </style>
         """, unsafe_allow_html=True)
@@ -407,17 +582,20 @@ def main():
         
         # Left Column: Post Content (PII-Redacted)
         with left_col:
+            st.markdown('<div class="scrollable-container">', unsafe_allow_html=True)
+            
             st.subheader("📝 Post Content (PII-Redacted - sent to LLM)")
             st.markdown(f"**Post ID:** `{post['POST_ID']}`")
             
             if pd.notna(post['TEXT_FOR_LLM']) and post['TEXT_FOR_LLM']:
-                st.text_area("", post['TEXT_FOR_LLM'], height=600,
-                            disabled=True, key="text_for_llm")
+                # Use dynamic key based on post_id to ensure content updates
+                st.text_area("", post['TEXT_FOR_LLM'], height=400,
+                            disabled=True, key=f"text_for_llm_{post['POST_ID']}")
             else:
                 st.info("No content available")
-        
-        # Right Column: LLM Output and Rating
-        with right_col:
+            
+            st.markdown("---")
+            
             # LLM Annotation Summary
             st.subheader("🤖 LLM Annotation Summary")
             
@@ -446,25 +624,33 @@ def main():
                 st.markdown("**Post Summary:**")
                 st.info(post['POST_SUMMARY'])
             
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Right Column: LLM Output and Rating
+        with right_col:
+            st.markdown('<div class="scrollable-container">', unsafe_allow_html=True)
+            
+            # Keywords above Care Response
             if 'KEYWORDS_STR' in post and post['KEYWORDS_STR']:
                 st.markdown("**Keywords:**")
                 st.code(post['KEYWORDS_STR'])
+                st.markdown("---")
             
+            # LLM-Generated Care Response
+            st.subheader("💬 LLM-Generated Care Response")
+            if pd.notna(post['CARE_RESPONSE']) and post['CARE_RESPONSE']:
+                # Use dynamic key based on post_id to ensure content updates
+                st.text_area("", post['CARE_RESPONSE'], height=250,
+                            disabled=True, key=f"care_response_{post['POST_ID']}")
+            else:
+                st.warning("No care response available")
+            
+            # Safety Flags below Care Response
             if ('SAFETY_FLAGS_STR' in post and
                 post['SAFETY_FLAGS_STR'] and
                 post['SAFETY_FLAGS_STR'] != 'None'):
                 st.markdown("**Safety Flags:**")
                 st.warning(post['SAFETY_FLAGS_STR'])
-            
-            st.markdown("---")
-            
-            # LLM-Generated Care Response
-            st.subheader("💬 LLM-Generated Care Response")
-            if pd.notna(post['CARE_RESPONSE']) and post['CARE_RESPONSE']:
-                st.text_area("", post['CARE_RESPONSE'], height=250,
-                            disabled=True, key="care_response")
-            else:
-                st.warning("No care response available")
             
             st.markdown("---")
             
@@ -534,8 +720,10 @@ def main():
                     st.error("Please enter your name")
                 else:
                     with st.spinner("Submitting rating..."):
+                        prompt_hash = post.get('PROMPT_HASH') if pd.notna(post.get('PROMPT_HASH')) else None
                         success = submit_rating(
                             post_id=post['POST_ID'],
+                            prompt_hash=prompt_hash,
                             clinician_name=clinician_name,
                             clinician_email=clinician_email,
                             rating_overall=rating_overall,
@@ -547,9 +735,6 @@ def main():
                         )
                         
                         if success:
-                            st.success("✅ Rating submitted successfully!")
-                            st.balloons()
-                            
                             # Track submitted rating
                             title = post.get('POST_TITLE', 'No Title')
                             if title and pd.notna(title):
@@ -563,9 +748,17 @@ def main():
                                 'timestamp': datetime.now(timezone.utc)
                             })
                             
-                            # Clear form
-                            st.session_state.clinician_name = ""
-                            st.session_state.clinician_email = ""
+                            # Move to next post if available
+                            total_posts = len(st.session_state.posts_df)
+                            current_idx = st.session_state.current_post_idx
+                            if current_idx < total_posts - 1:
+                                st.session_state.current_post_idx = current_idx + 1
+                                st.success("✅ Rating submitted successfully! Moving to next post...")
+                            else:
+                                st.success("✅ Rating submitted successfully! (Last post in list)")
+                            
+                            # Refresh the page to show next post and clear the form
+                            st.rerun()
                         else:
                             st.error("Failed to submit rating. Please try again.")
             
@@ -580,6 +773,9 @@ def main():
                     submitted_df[['post_id', 'post_title', 'timestamp']],
                     use_container_width=True
                 )
+            
+            # Close scrollable container for right column
+            st.markdown('</div>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
