@@ -188,15 +188,15 @@ def get_available_prompt_hashes_from_snowflake(
             f"{DATABASE_NAME}.{SCHEMA_NAME}.{INTERACTIONS_TABLE}"
         )
         query = f"""
-        SELECT DISTINCT prompt_hash
+        SELECT DISTINCT llm_prompt_hash
         FROM {table_name}
-        WHERE prompt_hash IS NOT NULL
-        ORDER BY prompt_hash
+        WHERE llm_prompt_hash IS NOT NULL
+        ORDER BY llm_prompt_hash
         """
         df = session.sql(query).collect()
         return [
-            row["PROMPT_HASH"] for row in df
-            if row["PROMPT_HASH"]
+            row["LLM_PROMPT_HASH"] for row in df
+            if row["LLM_PROMPT_HASH"]
         ]
     except Exception:
         return []
@@ -318,24 +318,26 @@ def ensure_interactions_table_exists(session: Session) -> bool:
     """
     Ensure the CUSTOM_LLM_INTERACTIONS table exists.
     Creates it if it doesn't exist.
+    Uses llm_system_prompt and llm_user_prompt to avoid reserved keywords.
     """
     try:
         table_name = (
             f"{DATABASE_NAME}.{SCHEMA_NAME}.{INTERACTIONS_TABLE}"
         )
+        # Use llm_ prefix for columns to avoid reserved keywords (SYSTEM, USER, PROMPT, INPUT, OUTPUT, MODEL)
         create_table_query = f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
             interaction_id VARCHAR(255) PRIMARY KEY,
-            user_input VARCHAR(16777216),
-            system_prompt VARCHAR(16777216),
-            user_prompt VARCHAR(16777216),
-            prompt_hash VARCHAR(50),
+            llm_user_input VARCHAR(16777216),
+            llm_system_prompt VARCHAR(16777216),
+            llm_user_prompt VARCHAR(16777216),
+            llm_prompt_hash VARCHAR(50),
             llm_output VARCHAR(16777216),
             review_feedback VARCHAR(5000),
             review_rating INTEGER,
-            model_name VARCHAR(100),
-            input_tokens INTEGER,
-            output_tokens INTEGER,
+            llm_model_name VARCHAR(100),
+            llm_input_tokens INTEGER,
+            llm_output_tokens INTEGER,
             created_at TIMESTAMP_TZ,
             reviewed_at TIMESTAMP_TZ,
             reviewer_name VARCHAR(255)
@@ -343,6 +345,50 @@ def ensure_interactions_table_exists(session: Session) -> bool:
         """
 
         session.sql(create_table_query).collect()
+        
+        # Check if required columns exist, add them if missing
+        # (handles case where table was created with old schema)
+        try:
+            # List of columns that need to be checked/added
+            columns_to_check = [
+                ('LLM_USER_INPUT', 'llm_user_input', 'VARCHAR(16777216)'),
+                ('LLM_SYSTEM_PROMPT', 'llm_system_prompt', 'VARCHAR(16777216)'),
+                ('LLM_USER_PROMPT', 'llm_user_prompt', 'VARCHAR(16777216)'),
+                ('LLM_PROMPT_HASH', 'llm_prompt_hash', 'VARCHAR(50)'),
+                ('LLM_MODEL_NAME', 'llm_model_name', 'VARCHAR(100)'),
+                ('LLM_INPUT_TOKENS', 'llm_input_tokens', 'INTEGER'),
+                ('LLM_OUTPUT_TOKENS', 'llm_output_tokens', 'INTEGER'),
+            ]
+            
+            for upper_col_name, lower_col_name, col_type in columns_to_check:
+                check_col = f"""
+                SELECT COUNT(*) as col_exists
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = UPPER('{SCHEMA_NAME}')
+                AND TABLE_NAME = UPPER('{INTERACTIONS_TABLE}')
+                AND TABLE_CATALOG = UPPER('{DATABASE_NAME}')
+                AND UPPER(COLUMN_NAME) = '{upper_col_name}'
+                """
+                col_result = session.sql(check_col).collect()
+                col_exists = (
+                    col_result[0]["COL_EXISTS"] > 0
+                    if col_result else False
+                )
+                
+                if not col_exists:
+                    alter_query = f"""
+                    ALTER TABLE {table_name}
+                    ADD COLUMN {lower_col_name} {col_type}
+                    """
+                    session.sql(alter_query).collect()
+        except Exception as migration_error:
+            # Migration check failed, but table creation succeeded
+            # Log warning but continue
+            st.warning(
+                f"Could not verify/add required columns: "
+                f"{migration_error}. Table may need manual migration."
+            )
+        
         return True
 
     except Exception as e:
@@ -402,16 +448,16 @@ def save_interaction(
         insert_query = f"""
         INSERT INTO {table_name} (
             interaction_id,
-            user_input,
-            system_prompt,
-            user_prompt,
-            prompt_hash,
+            llm_user_input,
+            llm_system_prompt,
+            llm_user_prompt,
+            llm_prompt_hash,
             llm_output,
             review_feedback,
             review_rating,
-            model_name,
-            input_tokens,
-            output_tokens,
+            llm_model_name,
+            llm_input_tokens,
+            llm_output_tokens,
             created_at,
             reviewed_at,
             reviewer_name
@@ -698,20 +744,24 @@ def main():
         st.markdown("---")
         with st.expander("📋 View Current Prompts", expanded=False):
             st.markdown("**System Prompt:**")
+            # Use dynamic key based on hash to force refresh when prompts change
+            system_key = f"display_system_{st.session_state.prompt_hash[:8]}"
             st.text_area(
                 "System",
                 value=st.session_state.system_prompt,
                 height=150,
                 disabled=True,
-                key="display_system"
+                key=system_key
             )
             st.markdown("**User Prompt:**")
+            # Use dynamic key based on hash to force refresh when prompts change
+            user_key = f"display_user_{st.session_state.prompt_hash[:8]}"
             st.text_area(
                 "User",
                 value=st.session_state.user_prompt,
                 height=150,
                 disabled=True,
-                key="display_user"
+                key=user_key
             )
             st.caption(f"**Current Hash:** `{st.session_state.prompt_hash}`")
         
