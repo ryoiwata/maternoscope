@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""
+Custom LLM Interaction Dashboard for Streamlit in Snowflake (SiS)
+
+This dashboard allows users to:
+1. Type in any text input
+2. Configure a custom prompt for LLM processing
+3. Get LLM responses
+4. Review and provide feedback on the responses
+5. Save all interactions (input, prompt, output, review) to Snowflake
+
+Usage:
+    Deploy to Streamlit in Snowflake (SiS) environment
+    Or run locally: streamlit run src/dashboard/custom_llm_dashboard.py
+"""
+
+import streamlit as st
+from snowflake.snowpark import Session
+from snowflake.snowpark.context import get_active_session
+from typing import Optional, Dict, Any, List
+import os
+import uuid
+import hashlib
+import re
+from pathlib import Path
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# Load environment variables
+load_dotenv()
+
+# ============================================================================
+# CONFIGURATION - Update these for your environment
+# ============================================================================
+
+# Configuration - uses environment variables with fallbacks
+DATABASE_NAME = os.getenv("SNOWFLAKE_DATABASE", "MATERNOSCOPE")
+SCHEMA_NAME = os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICS_ML")
+# Table to store interactions
+INTERACTIONS_TABLE = "CUSTOM_LLM_INTERACTIONS"
+
+# Get project root directory
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROMPTS_DIR = PROJECT_ROOT / "prompts"
+
+# Default prompt template (simple fallback)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Please analyze the following "
+    "input and provide a thoughtful response."
+)
+DEFAULT_USER_PROMPT = (
+    "Input:\n{user_input}\n\n"
+    "Please provide your analysis and response:"
+)
+
+# ============================================================================
+# SNOWFLAKE CONNECTION
+# ============================================================================
+
+
+@st.cache_resource
+def get_snowflake_session() -> Session:
+    """
+    Get Snowflake session.
+    Tries Streamlit in Snowflake (SiS) first, falls back to local connection.
+    """
+    # Try to get active session (for Streamlit in Snowflake)
+    try:
+        session = get_active_session()
+        return session
+    except Exception:
+        # Fall back to local connection using environment variables
+        try:
+            connection_parameters = {
+                "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+                "user": os.getenv("SNOWFLAKE_USERNAME"),
+                "password": os.getenv("SNOWFLAKE_PASSWORD"),
+                "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+                "database": os.getenv("SNOWFLAKE_DATABASE"),
+                "schema": os.getenv("SNOWFLAKE_SCHEMA", "ANALYTICS_ML"),
+                "role": os.getenv("SNOWFLAKE_ROLE"),
+            }
+
+            # Validate required parameters
+            required_params = ["account", "user", "password"]
+            missing_params = [
+                p for p in required_params
+                if not connection_parameters.get(p)
+            ]
+            if missing_params:
+                error_msg = (
+                    f"Missing required Snowflake environment variables: "
+                    f"{', '.join(missing_params)}. "
+                    "Please set them in your .env file."
+                )
+                st.error(error_msg)
+                st.stop()
+
+            # Create session from connection parameters
+            session = Session.builder.configs(connection_parameters).create()
+            return session
+        except Exception as e:
+            error_msg = (
+                f"Error connecting to Snowflake: {e}\n\n"
+                "For local development, ensure your .env file contains:\n"
+                "- SNOWFLAKE_ACCOUNT\n"
+                "- SNOWFLAKE_USERNAME\n"
+                "- SNOWFLAKE_PASSWORD\n"
+                "- SNOWFLAKE_WAREHOUSE\n"
+                "- SNOWFLAKE_DATABASE\n"
+                "- SNOWFLAKE_SCHEMA (optional, defaults to ANALYTICS_ML)\n"
+                "- SNOWFLAKE_ROLE"
+            )
+            st.error(error_msg)
+            st.stop()
+
+
+# ============================================================================
+# PROMPT MANAGEMENT FUNCTIONS
+# ============================================================================
+
+
+def calculate_prompt_hash(system_prompt: str, user_prompt: str) -> str:
+    """Calculate prompt hash from system and user prompts."""
+    combined = system_prompt + "\n\n" + user_prompt
+    return hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+
+@st.cache_data
+def scan_prompts_folder() -> List[Dict[str, Any]]:
+    """
+    Scan prompts folder and return available prompt pairs.
+    Returns list of dicts with system_file, user_file, and calculated hash.
+    """
+    prompts = []
+    
+    if not PROMPTS_DIR.exists():
+        return prompts
+    
+    # Find system prompt files
+    system_files = sorted(PROMPTS_DIR.glob("clinical_annotation_system_*.txt"))
+    
+    # Find user prompt files
+    user_files = sorted(PROMPTS_DIR.glob("clinical_annotation_user_*.txt"))
+    
+    # Try to match system and user prompts
+    for system_file in system_files:
+        for user_file in user_files:
+            try:
+                system_text = system_file.read_text(encoding='utf-8').strip()
+                user_text = user_file.read_text(encoding='utf-8').strip()
+                prompt_hash = calculate_prompt_hash(system_text, user_text)
+                
+                prompts.append({
+                    'system_file': system_file.name,
+                    'user_file': user_file.name,
+                    'system_prompt': system_text,
+                    'user_prompt': user_text,
+                    'prompt_hash': prompt_hash,
+                    'display_name': (
+                        f"{system_file.stem} + {user_file.stem} "
+                        f"(hash: {prompt_hash})"
+                    )
+                })
+            except Exception as e:
+                st.warning(f"Error reading {system_file.name} or {user_file.name}: {e}")
+                continue
+    
+    return prompts
+
+
+def get_prompt_by_hash(prompt_hash: str) -> Optional[Dict[str, Any]]:
+    """Get prompt pair by hash from prompts folder."""
+    prompts = scan_prompts_folder()
+    for prompt in prompts:
+        if prompt['prompt_hash'] == prompt_hash:
+            return prompt
+    return None
+
+
+def get_available_prompt_hashes_from_snowflake(
+    session: Session
+) -> List[str]:
+    """Get list of prompt hashes from existing interactions."""
+    try:
+        table_name = (
+            f"{DATABASE_NAME}.{SCHEMA_NAME}.{INTERACTIONS_TABLE}"
+        )
+        query = f"""
+        SELECT DISTINCT prompt_hash
+        FROM {table_name}
+        WHERE prompt_hash IS NOT NULL
+        ORDER BY prompt_hash
+        """
+        df = session.sql(query).collect()
+        return [
+            row["PROMPT_HASH"] for row in df
+            if row["PROMPT_HASH"]
+        ]
+    except Exception:
+        return []
+
+
+# ============================================================================
+# LLM FUNCTIONS
+# ============================================================================
+
+
+@st.cache_resource
+def get_llm_client():
+    """Initialize and cache LLM client."""
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            st.error("OPENAI_API_KEY not found in environment variables")
+            st.stop()
+        
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        
+        # Get temperature from env var, or use None (default) if not set
+        # Some models only support default temperature (1)
+        temp_str = os.getenv("OPENAI_TEMPERATURE", None)
+        temperature = float(temp_str) if temp_str else None
+        
+        # Build LLM config
+        llm_kwargs = {
+            "model": model_name,
+            "api_key": api_key,
+        }
+        
+        if os.getenv("OPENAI_ORG_ID"):
+            llm_kwargs["organization"] = os.getenv("OPENAI_ORG_ID")
+        
+        # Only set temperature if explicitly provided
+        # Some newer models only support default temperature
+        if temperature is not None:
+            llm_kwargs["temperature"] = temperature
+        
+        llm = ChatOpenAI(**llm_kwargs)
+        return llm
+    except Exception as e:
+        st.error(f"Error initializing LLM client: {e}")
+        st.stop()
+
+
+def call_llm(
+    user_input: str,
+    system_prompt: str,
+    user_prompt_template: str,
+    prompt_hash: str
+) -> Dict[str, Any]:
+    """
+    Call LLM with system and user prompts.
+    
+    Args:
+        user_input: The user's input text
+        system_prompt: System prompt (no placeholders)
+        user_prompt_template: User prompt template (may contain {user_input},
+                              {post_text}, {post_id}, etc.)
+        prompt_hash: Hash of the combined prompts
+    
+    Returns:
+        Dictionary with 'response', 'input_tokens', 'output_tokens',
+        'model_name', 'prompt_hash'
+    """
+    try:
+        llm = get_llm_client()
+        
+        # Replace common placeholders with {user_input} for formatting
+        # This allows prompts with {post_text} or {post_id} to work
+        formatted_user_prompt = user_prompt_template.replace(
+            "{post_text}", "{user_input}"
+        ).replace("{post_id}", "{user_input}")
+        
+        # Create prompt template with system and user messages
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("user", formatted_user_prompt)
+        ])
+        
+        # Format the prompt with user input
+        formatted_messages = prompt_template.format_messages(
+            user_input=user_input
+        )
+        
+        # Invoke LLM
+        llm_response = llm.invoke(formatted_messages)
+        
+        # Extract token usage
+        input_tokens = 0
+        output_tokens = 0
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        
+        if hasattr(llm_response, 'response_metadata'):
+            usage = llm_response.response_metadata.get('token_usage', {})
+            input_tokens = usage.get('prompt_tokens', 0)
+            output_tokens = usage.get('completion_tokens', 0)
+        
+        return {
+            'response': llm_response.content,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'model_name': model_name,
+            'prompt_hash': prompt_hash
+        }
+    except Exception as e:
+        st.error(f"Error calling LLM: {e}")
+        return None
+
+
+# ============================================================================
+# SNOWFLAKE TABLE FUNCTIONS
+# ============================================================================
+
+
+def ensure_interactions_table_exists(session: Session) -> bool:
+    """
+    Ensure the CUSTOM_LLM_INTERACTIONS table exists.
+    Creates it if it doesn't exist.
+    """
+    try:
+        table_name = (
+            f"{DATABASE_NAME}.{SCHEMA_NAME}.{INTERACTIONS_TABLE}"
+        )
+        create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            interaction_id VARCHAR(255) PRIMARY KEY,
+            user_input VARCHAR(16777216),
+            system_prompt VARCHAR(16777216),
+            user_prompt VARCHAR(16777216),
+            prompt_hash VARCHAR(50),
+            llm_output VARCHAR(16777216),
+            review_feedback VARCHAR(5000),
+            review_rating INTEGER,
+            model_name VARCHAR(100),
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            created_at TIMESTAMP_TZ,
+            reviewed_at TIMESTAMP_TZ,
+            reviewer_name VARCHAR(255)
+        )
+        """
+
+        session.sql(create_table_query).collect()
+        return True
+
+    except Exception as e:
+        st.error(f"Error creating interactions table: {e}")
+        return False
+
+
+def save_interaction(
+    session: Session,
+    interaction_id: str,
+    user_input: str,
+    system_prompt: str,
+    user_prompt: str,
+    prompt_hash: str,
+    llm_output: str,
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    review_feedback: Optional[str] = None,
+    review_rating: Optional[int] = None,
+    reviewer_name: Optional[str] = None
+) -> bool:
+    """
+    Save interaction to CUSTOM_LLM_INTERACTIONS table.
+    
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Escape single quotes for SQL
+        def escape_sql(text):
+            if text is None:
+                return "NULL"
+            return f"'{text.replace("'", "''")}'"
+        
+        # Prepare values
+        user_input_escaped = escape_sql(user_input)
+        system_prompt_escaped = escape_sql(system_prompt)
+        user_prompt_escaped = escape_sql(user_prompt)
+        llm_output_escaped = escape_sql(llm_output)
+        review_feedback_escaped = (
+            escape_sql(review_feedback) if review_feedback else "NULL"
+        )
+        review_rating_val = (
+            review_rating if review_rating is not None else "NULL"
+        )
+        reviewer_name_escaped = (
+            escape_sql(reviewer_name) if reviewer_name else "NULL"
+        )
+        reviewed_at = (
+            "CURRENT_TIMESTAMP()" if review_feedback else "NULL"
+        )
+
+        # Insert interaction
+        table_name = (
+            f"{DATABASE_NAME}.{SCHEMA_NAME}.{INTERACTIONS_TABLE}"
+        )
+        insert_query = f"""
+        INSERT INTO {table_name} (
+            interaction_id,
+            user_input,
+            system_prompt,
+            user_prompt,
+            prompt_hash,
+            llm_output,
+            review_feedback,
+            review_rating,
+            model_name,
+            input_tokens,
+            output_tokens,
+            created_at,
+            reviewed_at,
+            reviewer_name
+        ) VALUES (
+            '{interaction_id.replace("'", "''")}',
+            {user_input_escaped},
+            {system_prompt_escaped},
+            {user_prompt_escaped},
+            '{prompt_hash.replace("'", "''")}',
+            {llm_output_escaped},
+            {review_feedback_escaped},
+            {review_rating_val},
+            '{model_name.replace("'", "''")}',
+            {input_tokens},
+            {output_tokens},
+            CURRENT_TIMESTAMP(),
+            {reviewed_at},
+            {reviewer_name_escaped}
+        )
+        """
+        
+        session.sql(insert_query).collect()
+        return True
+
+    except Exception as e:
+        st.error(f"Error saving interaction: {e}")
+        return False
+
+
+def update_interaction_review(
+    session: Session,
+    interaction_id: str,
+    review_feedback: str,
+    review_rating: Optional[int] = None,
+    reviewer_name: Optional[str] = None
+) -> bool:
+    """
+    Update an existing interaction with review feedback.
+    
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Escape single quotes for SQL
+        def escape_sql(text):
+            if text is None:
+                return "NULL"
+            return f"'{text.replace("'", "''")}'"
+        
+        review_feedback_escaped = escape_sql(review_feedback)
+        review_rating_val = (
+            review_rating if review_rating is not None else "NULL"
+        )
+        reviewer_name_escaped = (
+            escape_sql(reviewer_name) if reviewer_name else "NULL"
+        )
+
+        table_name = (
+            f"{DATABASE_NAME}.{SCHEMA_NAME}.{INTERACTIONS_TABLE}"
+        )
+        update_query = f"""
+        UPDATE {table_name}
+        SET 
+            review_feedback = {review_feedback_escaped},
+            review_rating = {review_rating_val},
+            reviewer_name = {reviewer_name_escaped},
+            reviewed_at = CURRENT_TIMESTAMP()
+        WHERE interaction_id = '{interaction_id.replace("'", "''")}'
+        """
+        
+        session.sql(update_query).collect()
+        return True
+
+    except Exception as e:
+        st.error(f"Error updating interaction review: {e}")
+        return False
+
+
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
+
+
+def main():
+    """Main Streamlit application."""
+    st.set_page_config(
+        page_title="Custom LLM Interaction Dashboard",
+        page_icon="💬",
+        layout="wide"
+    )
+    
+    st.title("💬 Custom LLM Interaction Dashboard")
+    st.markdown("---")
+
+    # Get Snowflake session
+    session = get_snowflake_session()
+
+    # Ensure interactions table exists
+    if not ensure_interactions_table_exists(session):
+        error_msg = (
+            "Failed to initialize interactions table. "
+            "Please check permissions."
+        )
+        st.error(error_msg)
+        st.stop()
+    
+    # Initialize session state
+    if "interaction_id" not in st.session_state:
+        st.session_state.interaction_id = None
+    if "llm_response" not in st.session_state:
+        st.session_state.llm_response = None
+    if "interaction_saved" not in st.session_state:
+        st.session_state.interaction_saved = False
+    if "system_prompt" not in st.session_state:
+        st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
+    if "user_prompt" not in st.session_state:
+        st.session_state.user_prompt = DEFAULT_USER_PROMPT
+    if "prompt_hash" not in st.session_state:
+        st.session_state.prompt_hash = calculate_prompt_hash(
+            DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+        )
+    
+    # Sidebar for configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        st.markdown(f"**Database:** {DATABASE_NAME}")
+        st.markdown(f"**Schema:** {SCHEMA_NAME}")
+        st.markdown(f"**Table:** {INTERACTIONS_TABLE}")
+        
+        st.markdown("---")
+        st.markdown("### Model Settings")
+        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        st.info(f"Using model: **{model_name}**")
+
+        if st.button("🔄 Reset Session"):
+            st.session_state.interaction_id = None
+            st.session_state.llm_response = None
+            st.session_state.interaction_saved = False
+            st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
+            st.session_state.user_prompt = DEFAULT_USER_PROMPT
+            st.session_state.prompt_hash = calculate_prompt_hash(
+                DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
+            )
+            st.rerun()
+    
+    # Main content area
+    tab1, tab2 = st.tabs(["📝 New Interaction", "✏️ Review & Save"])
+    
+    with tab1:
+        st.header("Create New LLM Interaction")
+        
+        # User input section
+        st.subheader("📥 Your Input")
+        user_input = st.text_area(
+            "Enter your text here:",
+            height=200,
+            placeholder="Type anything you want the LLM to process...",
+            key="user_input"
+        )
+        
+        # Prompt selection and editing section
+        st.subheader("🎯 Prompt Configuration")
+        
+        # Prompt selection mode
+        prompt_mode = st.radio(
+            "Prompt Selection Mode:",
+            ["Select by Hash", "Edit Prompts"],
+            horizontal=True,
+            key="prompt_mode"
+        )
+        
+        if prompt_mode == "Select by Hash":
+            # Get available prompts from folder
+            folder_prompts = scan_prompts_folder()
+            
+            # Get available hashes from Snowflake
+            snowflake_hashes = get_available_prompt_hashes_from_snowflake(
+                session
+            )
+            
+            # Combine and deduplicate
+            all_hashes = set()
+            hash_to_prompt = {}
+            
+            for prompt in folder_prompts:
+                hash_val = prompt['prompt_hash']
+                all_hashes.add(hash_val)
+                hash_to_prompt[hash_val] = prompt
+            
+            for hash_val in snowflake_hashes:
+                all_hashes.add(hash_val)
+                # Try to find in folder prompts
+                if hash_val not in hash_to_prompt:
+                    found = get_prompt_by_hash(hash_val)
+                    if found:
+                        hash_to_prompt[hash_val] = found
+            
+            # Create options list
+            hash_options = sorted(list(all_hashes))
+            
+            if hash_options:
+                def format_hash_option(x):
+                    if x in hash_to_prompt and 'display_name' in hash_to_prompt[x]:
+                        name = hash_to_prompt[x]['display_name']
+                    else:
+                        name = 'from Snowflake'
+                    return f"{x} ({name})"
+
+                selected_hash = st.selectbox(
+                    "Select Prompt by Hash:",
+                    options=hash_options,
+                    format_func=format_hash_option,
+                    key="selected_prompt_hash"
+                )
+                
+                if st.button("Load Selected Prompt", key="load_prompt"):
+                    if selected_hash in hash_to_prompt:
+                        prompt_data = hash_to_prompt[selected_hash]
+                        system_prompt = prompt_data['system_prompt']
+                        user_prompt = prompt_data['user_prompt']
+                        
+                        # Replace {post_text} with {user_input} for compatibility
+                        # Also replace {post_id} with a placeholder
+                        user_prompt = user_prompt.replace("{post_text}", "{user_input}")
+                        user_prompt = user_prompt.replace("{post_id}", "{user_input}")
+                        
+                        # Recalculate hash with updated prompt
+                        new_hash = calculate_prompt_hash(system_prompt, user_prompt)
+                        
+                        st.session_state.system_prompt = system_prompt
+                        st.session_state.user_prompt = user_prompt
+                        st.session_state.prompt_hash = new_hash
+                        st.success(
+                            f"✅ Loaded prompt with hash: {selected_hash[:8]}... "
+                            f"(updated to {new_hash[:8]}...)"
+                        )
+                        st.rerun()
+                    else:
+                        st.warning(
+                            f"Prompt hash {selected_hash} found in Snowflake "
+                            "but not in prompts folder. Please use 'Edit "
+                            "Prompts' mode to recreate it."
+                        )
+            else:
+                st.info("No prompts found. Use 'Edit Prompts' mode to create one.")
+        
+        else:  # Edit Prompts mode
+            st.markdown("**Edit System and User Prompts:**")
+            
+            system_prompt = st.text_area(
+                "System Prompt:",
+                value=st.session_state.system_prompt,
+                height=200,
+                help="System prompt (instructions for the LLM)",
+                key="system_prompt_editor"
+            )
+            
+            user_prompt = st.text_area(
+                "User Prompt Template:",
+                value=st.session_state.user_prompt,
+                height=200,
+                help=(
+                    "User prompt template. Use {user_input}, {post_text}, "
+                    "or {post_id} as placeholders. They will all be "
+                    "replaced with your input text."
+                ),
+                key="user_prompt_editor"
+            )
+            
+            # Calculate and display hash
+            new_hash = calculate_prompt_hash(system_prompt, user_prompt)
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.info(f"**Prompt Hash:** `{new_hash}`")
+            with col2:
+                if st.button("💾 Save Prompts", key="save_prompts"):
+                    st.session_state.system_prompt = system_prompt
+                    st.session_state.user_prompt = user_prompt
+                    st.session_state.prompt_hash = new_hash
+                    st.success(f"✅ Prompts saved! Hash: {new_hash}")
+                    st.rerun()
+        
+        # Display current prompts
+        st.markdown("---")
+        with st.expander("📋 View Current Prompts", expanded=False):
+            st.markdown("**System Prompt:**")
+            st.text_area(
+                "System",
+                value=st.session_state.system_prompt,
+                height=150,
+                disabled=True,
+                key="display_system"
+            )
+            st.markdown("**User Prompt:**")
+            st.text_area(
+                "User",
+                value=st.session_state.user_prompt,
+                height=150,
+                disabled=True,
+                key="display_user"
+            )
+            st.caption(f"**Current Hash:** `{st.session_state.prompt_hash}`")
+        
+        # Validate user prompt has placeholder
+        has_placeholder = bool(
+            re.search(r'\{[^}]+\}', st.session_state.user_prompt)
+        )
+        if not has_placeholder:
+            warning_msg = (
+                "⚠️ Your user prompt template should include a placeholder "
+                "like `{user_input}`, `{post_text}`, etc."
+            )
+            st.warning(warning_msg)
+
+        # Generate LLM response
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            generate_button = st.button(
+                "🚀 Generate Response",
+                type="primary",
+                use_container_width=True
+            )
+        
+        if generate_button:
+            if not user_input.strip():
+                st.error("Please enter some text input first.")
+            else:
+                # Check for any placeholder pattern
+                has_placeholder = bool(
+                    re.search(r'\{[^}]+\}', st.session_state.user_prompt)
+                )
+                if not has_placeholder:
+                    error_msg = (
+                        "Please include a placeholder (e.g., `{user_input}`, "
+                        "`{post_text}`) in your user prompt template."
+                    )
+                    st.error(error_msg)
+                else:
+                    with st.spinner("Calling LLM..."):
+                        result = call_llm(
+                            user_input,
+                            st.session_state.system_prompt,
+                            st.session_state.user_prompt,
+                            st.session_state.prompt_hash
+                        )
+
+                        if result:
+                            st.session_state.llm_response = result
+                            st.session_state.interaction_id = str(uuid.uuid4())
+                            st.session_state.interaction_saved = False
+                            st.success("✅ LLM response generated!")
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Failed to generate response. "
+                                "Please try again."
+                            )
+
+        # Display LLM response if available
+        if st.session_state.llm_response:
+            st.markdown("---")
+            st.subheader("🤖 LLM Response")
+            
+            response_data = st.session_state.llm_response
+            st.text_area(
+                "Response:",
+                value=response_data['response'],
+                height=300,
+                disabled=True,
+                key="llm_response_display"
+            )
+            
+            # Show metadata
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Input Tokens", response_data['input_tokens'])
+            with col2:
+                st.metric("Output Tokens", response_data['output_tokens'])
+            with col3:
+                st.metric("Model", response_data['model_name'])
+            with col4:
+                prompt_hash_display = response_data.get(
+                    'prompt_hash', st.session_state.prompt_hash
+                )
+                short_hash = prompt_hash_display[:8] + "..."
+                st.metric("Prompt Hash", short_hash)
+                st.caption(f"Full: {prompt_hash_display}")
+            
+            # Auto-save interaction (without review)
+            if not st.session_state.interaction_saved:
+                with st.spinner("Saving interaction..."):
+                    success = save_interaction(
+                        session,
+                        st.session_state.interaction_id,
+                        user_input,
+                        st.session_state.system_prompt,
+                        st.session_state.user_prompt,
+                        st.session_state.prompt_hash,
+                        response_data['response'],
+                        response_data['model_name'],
+                        response_data['input_tokens'],
+                        response_data['output_tokens']
+                    )
+
+                    if success:
+                        st.session_state.interaction_saved = True
+                        st.success("✅ Interaction saved to Snowflake!")
+                    else:
+                        st.error("❌ Failed to save interaction.")
+    
+    with tab2:
+        st.header("Review & Provide Feedback")
+
+        if (not st.session_state.llm_response or
+                not st.session_state.interaction_id):
+            info_msg = (
+                "👆 Please generate an LLM response first in the "
+                "'New Interaction' tab."
+            )
+            st.info(info_msg)
+        else:
+            # Display current interaction
+            st.subheader("📋 Current Interaction")
+
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Your Input:**")
+                st.text_area(
+                    "Input",
+                    value=st.session_state.get("user_input", ""),
+                    height=150,
+                    disabled=True,
+                    key="review_input_display"
+                )
+            
+            with col2:
+                st.markdown("**LLM Output:**")
+                st.text_area(
+                    "Output",
+                    value=st.session_state.llm_response['response'],
+                    height=150,
+                    disabled=True,
+                    key="review_output_display"
+                )
+            
+            # Review form
+            st.markdown("---")
+            st.subheader("✏️ Your Review")
+
+            with st.form("review_form", clear_on_submit=False):
+                reviewer_name = st.text_input(
+                    "Your Name (optional):",
+                    placeholder="Enter your name",
+                    key="reviewer_name"
+                )
+
+                review_rating = st.slider(
+                    "Rating (1-5):",
+                    min_value=1,
+                    max_value=5,
+                    value=3,
+                    help=(
+                        "1 = Poor, 2 = Below Average, 3 = Average, "
+                        "4 = Good, 5 = Excellent"
+                    ),
+                    key="review_rating"
+                )
+
+                review_feedback = st.text_area(
+                    "Review Feedback:",
+                    height=200,
+                    placeholder="Provide your feedback on the LLM response...",
+                    help=(
+                        "Share your thoughts on the quality, accuracy, "
+                        "usefulness, etc."
+                    ),
+                    key="review_feedback"
+                )
+
+                submitted = st.form_submit_button(
+                    "💾 Save Review",
+                    use_container_width=True,
+                    type="primary"
+                )
+
+                if submitted:
+                    if not review_feedback.strip():
+                        st.error("Please provide some review feedback.")
+                    else:
+                        # Update interaction with review
+                        with st.spinner("Saving review..."):
+                            success = update_interaction_review(
+                                session,
+                                st.session_state.interaction_id,
+                                review_feedback,
+                                review_rating,
+                                reviewer_name if reviewer_name.strip()
+                                else None
+                            )
+
+                            if success:
+                                st.success("✅ Review saved successfully!")
+                                st.balloons()
+
+                                # Option to create new interaction
+                                if st.button("🆕 Create New Interaction"):
+                                    st.session_state.interaction_id = None
+                                    st.session_state.llm_response = None
+                                    st.session_state.interaction_saved = False
+                                    st.rerun()
+                            else:
+                                error_msg = (
+                                    "❌ Failed to save review. "
+                                    "Please try again."
+                                )
+                                st.error(error_msg)
+
+    # Footer
+    st.markdown("---")
+    footer_text = (
+        f"Database: {DATABASE_NAME} | Schema: {SCHEMA_NAME} | "
+        f"Table: {INTERACTIONS_TABLE}"
+    )
+    st.caption(footer_text)
+
+
+if __name__ == "__main__":
+    main()
