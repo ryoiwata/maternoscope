@@ -1,0 +1,18 @@
+requests
+openai
+python-dotenv
+praw
+pandas
+snowflake-connector-python[pandas]
+snowflake-sqlalchemy
+streamlit
+# python-dateutil
+
+# LangChain dependencies for LLM prompt management
+langchain-core
+langchain-openai
+pyyaml
+
+# Airflow dependencies
+apache-airflow==2.8.0
+dbt-snowflake>=1.6.0
