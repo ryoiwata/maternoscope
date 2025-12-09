@@ -17,6 +17,8 @@ A comprehensive data pipeline for collecting, processing, and analyzing Reddit p
 
 The MaternoScope pipeline follows a modern data engineering architecture:
 
+![Data Flow Diagram](data_flow.gif)
+
 ```
 Reddit API → Ingestion → Snowflake (INGEST) → dbt Staging (BRONZE) 
     → LLM Annotation (ANALYTICS_ML) → dbt Marts (ANALYTICS_GOLD) → Dashboards
@@ -294,6 +296,7 @@ LLM experiments can be configured via YAML files in `config/llm_experiments.yaml
 
 ## Documentation
 
+- [Data Flow Diagram](docs/DATA_FLOW_DIAGRAM.md) - Comprehensive overview of data flow through the pipeline
 - [Airflow Pipeline Guide](airflow/README.md)
 - [dbt Configuration Guide](dbt_maternoscope/README_DBT_CONFIG.md)
 - [LLM Annotation Guide](src/llm/README.md)
