@@ -17,7 +17,7 @@ A comprehensive data pipeline for collecting, processing, and analyzing Reddit p
 
 The MaternoScope pipeline follows a modern data engineering architecture:
 
-![Data Flow Diagram](data_flow.gif)
+![Data Flow Diagram](images/data_flow.gif)
 
 ```
 Reddit API → Ingestion → Snowflake (INGEST) → dbt Staging (BRONZE) 
@@ -102,6 +102,8 @@ Then:
 
 The pipeline runs daily at midnight by default.
 
+![Airflow Dashboard](images/airflow_screenshot.png)
+
 ### Individual Components
 
 #### 1. Reddit Data Ingestion
@@ -180,6 +182,8 @@ streamlit run src/dashboard/custom_llm_dashboard.py
 
 Dashboards open at http://localhost:8501
 
+![Streamlit Dashboard](images/streamlit_dashboard.png)
+
 ### Airflow Utilities
 
 ```bash
@@ -237,6 +241,8 @@ maternoscope/
 - **ANALYTICS_ML**: LLM annotations (`REDDIT_POSTS_ANNOTATED`)
 - **ANALYTICS_GOLD**: Final BI-ready views (`REDDIT_POST_REVIEW`, `FCT_REDDIT_POSTS_ANNOTATED`)
 - **ANALYTICS_REF**: Reference data (`CLINICIAN_RATINGS`)
+
+![Snowflake Data Warehouse](images/snowflake_screenshot.png)
 
 ### Pipeline Tasks
 
